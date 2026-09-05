@@ -50,9 +50,9 @@ sensitive blocks.
 ## Requirements and compatibility
 
 RainFusion requires Ascend NPU and `mindiesd`. Selecting it on another
-platform raises. It is incompatible with ring sequence parallelism because
-the kernel needs the complete key sequence for ranking; use Ulysses sequence
-parallelism with `ring_degree=1`.
+platform raises. Ring and AllGather-KV sequence parallelism are unsupported:
+sparse planning needs full Q/K/V sequences. Use Ulysses with `ring_degree=1`
+and `allgather_degree=1`.
 
 The `precision` knob requires a MindIE-SD release whose `sparse_attention`
 accepts `precision=`; older releases accept it through `**kwargs` but
@@ -78,3 +78,56 @@ Protected video tails require a compatible MindIE-SD release.
 For common configuration and selector behavior, see the
 [attention backend overview](../attention_backends.md) and the
 [backend selection design](../../../design/feature/attention_backend_selection.md).
+
+## Wan2.2 precision and dense fallback
+
+Wan publishes the post-patch video grid and valid sequence length. MindIE owns
+mask generation, video rearrangement and inverse rearrangement; Omni only slices
+structural tail padding and restores the output shape.
+
+```yaml
+diffusion_attention_config:
+  per_role:
+    self:
+      backend: RAINFUSION_ATTN
+      quant:
+        method: fp8
+        fallback: [float]
+        skip_steps: "0,49"
+      block_sparse:
+        sparsity: 0.8
+        start_step: 2
+        end_step: 2
+    cross:
+      backend: FLASH_ATTN
+```
+
+For 50 denoise steps, `start_step=2, end_step=2` makes steps 0, 1, 48 and 49
+dense. `end_step` is a **count**, not an absolute step index. Missing progress
+information keeps the call dense when a step window cannot be evaluated.
+Denoise indices continue across the high/low-noise transformer boundary.
+
+Precision and sparsity are independent: quantization skips use sparse BF16
+when sparse geometry remains eligible; sparse skips use dense FA with the same
+configured quantization chain. `quant.method=float` disables quantization.
+Sparse MXFP4/MXFP8 are not implemented: list `fp8` or `float` fallback explicitly
+if those methods are selected for a RainFusion role. Legacy
+`block_sparse.precision=bf16/fp8/mix` remains supported; without a `quant` spec its
+dense fallback remains unquantized unless a legacy diffusion dtype is set.
+
+Single-video quantized calls explicitly use `sparse_type=rf_v3` and require
+`sparse_attention(precision=...)`; FP8 additionally requires the
+`fp8_rotate_quant_bsa` Runtime symbol. BF16 keeps the existing `rf_v2` route.
+A single-video model does not require `video_spans` support. Multi-video geometry
+checks that capability at execution; quantized multi-video attention remains
+unsupported unless a configured `float` fallback selects sparse BF16.
+
+Sparse rotation defaults remain owned by MindIE (currently seed 1234 in the
+Runtime). An explicit `quant.rotation_seed` is accepted only when the high-level
+sparse API exposes that parameter; otherwise it requires a configured precision
+fallback or raises. Dense FP8/MXFP8 uses Omni's legacy seed 425500. Do not assume
+these two paths have identical numerical baselines.
+
+Caller-supplied masks and piecewise visibility use dense attention. Wan marks its
+SP padding-only mask with `extra.attn_mask_is_padding`; RainFusion may remove
+that padding by trimming the gathered tensors to `video_layout.used_len`.

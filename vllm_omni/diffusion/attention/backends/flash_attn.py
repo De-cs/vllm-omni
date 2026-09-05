@@ -80,7 +80,7 @@ class FlashAttentionImpl(AttentionImpl):
     # authors can opt a specific Attention layer out via
     # ``Attention(disable_kv_quant=True)``.
     _supported_kv_cache_dtypes = {
-        "npu": {"fp8"},
+        "npu": {"fp8", "mxfp8", "mxfp4"},
     }
 
     def __init__(
@@ -103,8 +103,12 @@ class FlashAttentionImpl(AttentionImpl):
         self.is_cross_attn = role == "cross"
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
-        if backend_kwargs:
-            logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
+        self.quant = dict((backend_kwargs or {}).get("quant") or {})
+        if self.quant and not current_omni_platform.is_npu():
+            raise ValueError("FlashAttention quant.method is supported only on NPU.")
+        unknown = set(backend_kwargs or {}) - {"quant"}
+        if unknown:
+            logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", sorted(unknown))
 
     def _warn_fa_deterministic_non_dense(self, path: str) -> None:
         if not self.fa_deterministic:
@@ -484,30 +488,117 @@ class FlashAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         """NPU attention implementation using mindiesd."""
 
-        kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
-        if kv_cache_dtype is not None:
+        extra = attn_metadata.extra if attn_metadata else {}
+        method = extra.get("kv_cache_dtype", self.quant.get("method"))
+        if not extra.get("disable_attention_quant") and method not in (None, "float", "auto"):
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
         return self.forward_fa_npu(query, key, value, attn_metadata)
 
-    def forward_fa_quant_npu(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AttentionMetadata = None,
-    ) -> torch.Tensor:
-        from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_fa
+    @staticmethod
+    def _load_quant_runtime(method):
+        # Import only the selected concrete function, and only inside NPU execution.
+        if method == "fp8":
+            from mindiesd.layers.flash_attn.quant_flash_attn import fp8_rotate_quant_fa
 
-        layout = self.qkv_layout or "BNSD"
-        # Models pass (B, S, H, D); NPU fused op expects (B, N, S, D).
-        out = fp8_rotate_quant_fa(
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            layout=layout,
-            softmax_scale=self.softmax_scale,
-        )
-        return out.transpose(1, 2)
+            return fp8_rotate_quant_fa
+        if method == "mxfp8":
+            from mindiesd.layers.flash_attn.quant_flash_attn import mxfp8_rotate_quant_fa
+
+            return mxfp8_rotate_quant_fa
+        if method == "mxfp4":
+            from mindiesd.layers.flash_attn.quant_flash_attn import mxfp4_quant_fa
+
+            return mxfp4_quant_fa
+        raise ValueError(f"Unsupported NPU attention quantization method {method!r}.")
+
+    def _quant_unsupported_reason(self, method, query, key, value, attn_metadata):
+        layout = self.qkv_layout
+        if layout not in ("BSND", "BNSD"):
+            return "quantized FA requires an explicit BSND or BNSD layout"
+        if self.causal:
+            return "causal quantized FA is not supported"
+        extra = attn_metadata.extra if attn_metadata else {}
+        if any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k")) or extra.get("npu_attn_varlen"):
+            return "packed/varlen metadata requires the float attention path"
+        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            return "piecewise attention requires the float attention path"
+        if any(t.ndim != 4 or t.dtype not in (torch.float16, torch.bfloat16) for t in (query, key, value)):
+            return "quantized FA requires four-dimensional BF16/FP16 tensors"
+        if key.shape != value.shape or query.shape[0] != key.shape[0] or query.shape[-1] != key.shape[-1]:
+            return "incompatible Q/K/V geometry"
+        if query.dtype != key.dtype or query.dtype != value.dtype:
+            return "Q/K/V dtypes must match"
+        seq_axis, head_axis = (1, 2) if layout == "BSND" else (2, 1)
+        if key.shape[head_axis] == 0 or query.shape[head_axis] % key.shape[head_axis]:
+            return "Q head count must be a positive multiple of K/V head count"
+        if query.shape[seq_axis] == 0 or key.shape[seq_axis] == 0:
+            return "empty sequences are not supported"
+        dim = query.shape[-1]
+        if method in ("fp8", "mxfp8") and (dim == 0 or dim & (dim - 1)):
+            return "generated Hadamard rotations require a power-of-two head dimension"
+        if method == "fp8" and (query.shape[0] != 1 or query.shape[head_axis] != key.shape[head_axis]):
+            return "block-FP8 Runtime requires batch size 1 and equal Q/K/V head counts"
+        mask = attn_metadata.attn_mask if attn_metadata else None
+        if mask is not None:
+            if mask.dtype != torch.bool:
+                return "quantized FA requires a boolean keep mask"
+            q_len, k_len = query.shape[seq_axis], key.shape[seq_axis]
+            if mask.ndim == 2 and tuple(mask.shape) not in ((query.shape[0], k_len), (q_len, k_len)):
+                return "invalid two-dimensional attention mask shape"
+            if mask.ndim not in (2, 4):
+                return "quantized FA supports only two- or four-dimensional masks"
+            if mask.ndim == 4 and (
+                mask.shape[0] not in (1, query.shape[0])
+                or mask.shape[1] not in (1, query.shape[head_axis])
+                or mask.shape[2] not in (1, q_len)
+                or mask.shape[3] != k_len
+            ):
+                return "invalid four-dimensional attention mask shape"
+            if method == "mxfp8" and query.shape[0] != 1:
+                return "masked batched MXFP8 TND attention is not supported"
+            if method == "mxfp4" and (query.shape[seq_axis] % 128 or key.shape[seq_axis] % 128):
+                return "masked MXFP4 requires sequence lengths aligned to 128"
+        return None
+
+    def forward_fa_quant_npu(self, query, key, value, attn_metadata=None):
+        extra = attn_metadata.extra if attn_metadata else {}
+        method = extra.get("kv_cache_dtype", self.quant.get("method", "fp8"))
+        fallback = extra.get("quant_fallback", self.quant.get("fallback", ()))
+        reasons = []
+        for candidate in (method, *fallback):
+            if candidate == "float":
+                logger.warning_once("NPU attention falling back to float: %s", "; ".join(reasons))
+                return self.forward_fa_npu(query, key, value, attn_metadata)
+            reason = self._quant_unsupported_reason(candidate, query, key, value, attn_metadata)
+            if reason is not None:
+                reasons.append(f"{candidate}: {reason}")
+                continue
+            try:
+                runtime = self._load_quant_runtime(candidate)
+            except ImportError as exc:
+                if not fallback:
+                    raise ImportError(
+                        f"NPU {candidate} attention requires a compatible MindIE-SD quant Runtime."
+                    ) from exc
+                reasons.append(f"{candidate}: MindIE-SD Runtime unavailable ({exc})")
+                continue
+            mask = attn_metadata.attn_mask if attn_metadata else None
+            if mask is not None:
+                # Omni uses True=keep. The quant Runtime passes its mask directly
+                # to CANN, which uses True=blocked (unlike attention_forward).
+                q_bsnd = query if self.qkv_layout == "BSND" else query.transpose(1, 2)
+                k_bsnd = key if self.qkv_layout == "BSND" else key.transpose(1, 2)
+                mask = ~_maybe_reshape_attn_mask(q_bsnd, k_bsnd, mask, mask_mode="full_qk")
+            kwargs = dict(layout=self.qkv_layout, attn_mask=mask, softmax_scale=self.softmax_scale)
+            # MXFP4 does not generate rotations or accept rotation_seed.
+            if candidate in ("fp8", "mxfp8"):
+                kwargs["rotation_seed"] = extra.get("rotation_seed", self.quant.get("rotation_seed", 425500))
+            if reasons:
+                logger.warning_once("NPU attention falling back to %s: %s", candidate, "; ".join(reasons))
+            logger.info_once("NPU attention uses MindIE-SD %s Runtime, layout=%s.", candidate, self.qkv_layout)
+            # Execution errors propagate. Never retry after an operator failure.
+            return runtime(query, key, value, **kwargs)
+        raise ValueError("No supported NPU attention quantization method: " + "; ".join(reasons))
 
     def forward_fa_npu(
         self,
@@ -516,6 +607,31 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
+        extra = attn_metadata.extra if attn_metadata else {}
+        mask = attn_metadata.attn_mask if attn_metadata else None
+        packed = any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k"))
+        piecewise = attn_metadata is not None and attn_metadata.full_attn_spans is not None
+        use_sdpa = self.causal or query.dtype == torch.float32
+        if mask is None and (
+            piecewise or ((packed or extra.get("npu_attn_varlen")) and (use_sdpa or not extra.get("npu_attn_varlen")))
+        ):
+            raise ValueError("NPU float attention requires an explicit mask for unsupported packed/piecewise metadata.")
+        if use_sdpa:
+            layout = self.qkv_layout or "BNSD"
+            q, k, v = (tensor.transpose(1, 2) if layout == "BSND" else tensor for tensor in (query, key, value))
+            mask = attn_metadata.attn_mask if attn_metadata else None
+            if mask is not None:
+                mask = _maybe_reshape_attn_mask(q.transpose(1, 2), k.transpose(1, 2), mask)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                is_causal=self.causal,
+                scale=self.softmax_scale,
+                enable_gqa=q.shape[1] != k.shape[1],
+            )
+            return out.transpose(1, 2) if layout == "BSND" else out
         try:
             from mindiesd import attention_forward
         except ImportError:
@@ -560,14 +676,17 @@ class FlashAttentionImpl(AttentionImpl):
         # [B, N, Sq, Skv], [B, 1, Sq, Skv], [1, 1, Sq, Skv], or [Sq, Skv]
         # But the incoming mask is 2D [B, S] — reshape to [B, 1, 1, S]
         # So reuse SDPA's mask reshape logic: [B, S] -> [B, 1, Sq, Skv]
-        attention_mask = _maybe_reshape_attn_mask(query, key, attention_mask, mask_mode="full_qk")
-
         layout = self.qkv_layout or "BNSD"
+        q_bsnd = query if layout == "BSND" else query.transpose(1, 2)
+        k_bsnd = key if layout == "BSND" else key.transpose(1, 2)
+        attention_mask = _maybe_reshape_attn_mask(q_bsnd, k_bsnd, attention_mask, mask_mode="full_qk")
+
         return attention_forward(
             query,
             key,
             value,
             attn_mask=attention_mask,
+            scale=self.softmax_scale,
             opt_mode="manual",
             op_type="fused_attn_score",
             layout=layout,

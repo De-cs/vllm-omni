@@ -15,6 +15,17 @@ This method supports three modes:
 | **Offline (Native)** | msModelSlim-exported MXFP8 weights converted to diffusers format via `merge_mxfp8_checkpoint.py` — weights and scales are loaded directly from the preprocessed checkpoint |
 | **Offline (AutoRound)** | AutoRound MXFP8 checkpoints with `data_type="mx_fp"` — auto-detected from `config.json` |
 
+## NPU Runtime dependency
+
+NPU **online** MXFP8 requires a MindIE-SD build exporting
+`MXFP8OnlineLinearRuntime` and `MXFP8LinearState` from
+`mindiesd.layers.quant_linear`. Missing APIs raise an actionable import error.
+Omni still loads the checkpoint and completes TP/fused-QKV partitioning before
+calling `prepare`. Prepared weight and scale are registered on the Linear module;
+each forward constructs a state from current parameters so device offload does
+not retain stale storage. Dummy/meta loading and the prepare-once guard remain
+in Omni. Native offline MXFP8 and XPU execution keep their existing implementations.
+
 ## Hardware Support
 
 | Device | Online | Offline (Native) | Offline (AutoRound) |

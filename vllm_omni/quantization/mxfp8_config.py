@@ -431,14 +431,33 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
 
       create_weights   : _LazyWeightMixin      (meta device + patched loader)
       process_weights  : NPUMxfp8OnlineLinearMethod  (BF16 → FP8 + normalize)
-      apply / ops      : NPUMxfp8LinearMethod / MXFPLinearMethodBase  (shared)
+      apply            : MXFPLinearMethodBase (reshape only)
+      prepare / forward: MindIE-SD MXFP8OnlineLinearRuntime
     """
+
+    def __init__(self, quant_config: DiffusionMXFP8Config) -> None:
+        super().__init__(quant_config)
+        try:
+            from mindiesd.layers.quant_linear import MXFP8OnlineLinearRuntime
+        except ImportError as exc:
+            raise ImportError(
+                "NPU online MXFP8 requires MindIE-SD with "
+                "mindiesd.layers.quant_linear.MXFP8OnlineLinearRuntime. "
+                "Install a compatible MindIE-SD build."
+            ) from exc
+        self._mindie_runtime = MXFP8OnlineLinearRuntime()
+        logger.info_once("NPU online MXFP8 Linear uses MindIE-SD MXFP8OnlineLinearRuntime.")
+
+    def _apply_inner(self, layer, x, bias, ori_dtype):
+        from mindiesd.layers.quant_linear import MXFP8LinearState
+
+        # Offload/HSDP may replace storage. The module owns every tensor.
+        state = MXFP8LinearState(weight=layer.weight, weight_scale=layer.weight_scale)
+        return self._mindie_runtime.forward(x, state, bias=bias, output_dtype=ori_dtype)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
-
-        import torch_npu
 
         # Materialise weight if still on meta device (dummy-weight init path).
         if layer.weight.device == torch.device("meta"):
@@ -452,15 +471,10 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
             layer.register_parameter("weight", weight)
             initialize_single_dummy_weight(layer.weight)
 
-        # NPU: quantize BF16/FP16 (N, K) → FP8 (N, K) + MX scale (N, S).
-        weight_fp8, weight_scale_raw = torch_npu.npu_dynamic_mx_quant(layer.weight, dst_type=torch_npu.float8_e4m3fn)
-
-        # Normalize to canonical layout shared with offline path.
-        weight_scale = weight_scale_raw.reshape(weight_scale_raw.shape[0], -1, 2).transpose(0, 1).contiguous()
-        weight_fp8 = weight_fp8.transpose(0, 1).contiguous()
-
-        replace_parameter(layer, "weight", weight_fp8)
-        replace_parameter(layer, "weight_scale", weight_scale)
+        # The loader has completed TP partitioning and all fused Q/K/V chunks.
+        state = self._mindie_runtime.prepare(layer.weight, dtype=layer.orig_dtype)
+        replace_parameter(layer, "weight", state.weight)
+        replace_parameter(layer, "weight_scale", state.weight_scale)
         layer._already_called_process_weights_after_loading = True
 
 

@@ -225,7 +225,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t)
+                self.record_denoise_step(step_idx, t, total_steps=len(timesteps))
 
                 if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
                     current_model = self.transformer_2
