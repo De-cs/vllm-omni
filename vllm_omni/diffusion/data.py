@@ -1671,6 +1671,8 @@ class AttnQuantSpec:
     method: str | None = None
     fallback: list[str] = field(default_factory=list)
     rotation_seed: int | None = None
+    mxfp4_dst_type_max: float | None = None
+    mxfp4_scale_alg: int | None = None
     skip_steps: str | list[int] | None = None
     skip_layers: str | list[int] | None = None
 
@@ -1702,6 +1704,22 @@ class AttnQuantSpec:
             isinstance(self.rotation_seed, bool) or not isinstance(self.rotation_seed, int)
         ):
             raise ValueError("quant.rotation_seed must be an integer.")
+        if self.mxfp4_dst_type_max is not None or self.mxfp4_scale_alg is not None:
+            if "mxfp4" not in chain:
+                raise ValueError("MXFP4 parameters require mxfp4 in the precision chain.")
+        if self.mxfp4_dst_type_max is not None and (
+            isinstance(self.mxfp4_dst_type_max, bool)
+            or not isinstance(self.mxfp4_dst_type_max, (float, int))
+            or not math.isfinite(self.mxfp4_dst_type_max)
+            or self.mxfp4_dst_type_max < 0
+        ):
+            raise ValueError("quant.mxfp4_dst_type_max must be finite and non-negative.")
+        if self.mxfp4_scale_alg is not None and (
+            isinstance(self.mxfp4_scale_alg, bool)
+            or not isinstance(self.mxfp4_scale_alg, int)
+            or self.mxfp4_scale_alg < 0
+        ):
+            raise ValueError("quant.mxfp4_scale_alg must be None or a non-negative integer.")
         parse_kv_cache_skip_selector(self.skip_steps)
         parse_kv_cache_skip_selector(self.skip_layers)
         for name, v in (("dtype_qk", self.dtype_qk), ("dtype_vo", self.dtype_vo)):
@@ -1804,6 +1822,12 @@ class AttentionSpec:
                     f"quant is only supported by the {' and '.join(allowed)} backends "
                     f"for these fields; got {self.backend!r}."
                 )
+        if (
+            self.quant is not None
+            and (self.quant.mxfp4_dst_type_max is not None or self.quant.mxfp4_scale_alg is not None)
+            and self.backend.upper() != "RAINFUSION_ATTN"
+        ):
+            raise ValueError("MXFP4 range/scale parameters currently require RAINFUSION_ATTN.")
         if self.quant is not None and self.quant.method is not None and self.block_sparse is not None:
             precision = self.block_sparse.precision
             if precision != "bf16" and precision != self.quant.method:
@@ -1845,6 +1869,9 @@ class AttentionSpec:
         if self.quant is not None and self.quant.method is not None:
             q = self.quant
             kw["quant"] = {"method": q.method, "fallback": list(q.fallback)}
+            for name in ("mxfp4_dst_type_max", "mxfp4_scale_alg"):
+                if getattr(q, name) is not None:
+                    kw["quant"][name] = getattr(q, name)
             if q.rotation_seed is not None:
                 kw["quant"]["rotation_seed"] = q.rotation_seed
         elif self.quant is not None and self.quant.enabled:

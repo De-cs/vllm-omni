@@ -110,8 +110,8 @@ Denoise indices continue across the high/low-noise transformer boundary.
 Precision and sparsity are independent: quantization skips use sparse BF16
 when sparse geometry remains eligible; sparse skips use dense FA with the same
 configured quantization chain. `quant.method=float` disables quantization.
-Sparse MXFP4/MXFP8 are not implemented: list `fp8` or `float` fallback explicitly
-if those methods are selected for a RainFusion role. Legacy
+Sparse MXFP4 requires the MindIE V3 runtime described below. Sparse MXFP8 remains
+unsupported; configure `fp8` or `float` fallback explicitly if selecting it. Legacy
 `block_sparse.precision=bf16/fp8/mix` remains supported; without a `quant` spec its
 dense fallback remains unquantized unless a legacy diffusion dtype is set.
 
@@ -124,8 +124,9 @@ A single-video model does not require `video_spans` support. Multi-video geometr
 checks that capability at execution; quantized multi-video attention remains
 unsupported unless a configured `float` fallback selects sparse BF16.
 
-Sparse rotation defaults remain owned by MindIE (currently seed 1234 in the
-Runtime). An explicit `quant.rotation_seed` is accepted only when the high-level
+Sparse rotation defaults remain owned by MindIE: FP8 and MXFP4 preserve the
+upstream standard Hadamard rotation without random signs. An explicit
+`quant.rotation_seed` is accepted only when the high-level
 sparse API exposes that parameter; otherwise it requires a configured precision
 fallback or raises. Dense FP8/MXFP8 uses Omni's legacy seed 425500. Do not assume
 these two paths have identical numerical baselines.
@@ -133,3 +134,48 @@ these two paths have identical numerical baselines.
 Caller-supplied masks and piecewise visibility use dense attention. Wan marks its
 SP padding-only mask with `extra.attn_mask_is_padding`; RainFusion may remove
 that padding by trimming the gathered tensors to `video_layout.used_len`.
+
+## Wan2.2 T2V BSA MXFP4
+
+```yaml
+diffusion_attention_config:
+  per_role:
+    self:
+      backend: RAINFUSION_ATTN
+      quant:
+        method: mxfp4
+        fallback: []
+        mxfp4_dst_type_max: 0.0
+        mxfp4_scale_alg: null
+      block_sparse:
+        sparsity: 0.8
+        start_step: 0
+        end_step: 0
+    cross:
+      backend: FLASH_ATTN
+```
+
+The default range `0.0` and scale algorithm `null` preserve MindIE's OCP mode.
+Set range `7.25` explicitly for the CX configuration; keep the same setting in
+quality comparisons. These typed `quant` fields are specific to RainFusion and
+are forwarded only when the selected sparse precision is MXFP4. They do not
+change dense FA defaults or Linear quantization.
+
+The installed MindIE must expose `mxfp4_rotate_quant_bsa`, the public MXFP4
+parameters, and `get_bsa_supported_precisions()`. The latter must report MXFP4
+from the plugin's actual CANN V3 capability, rather than just the chip model or
+an operator name. Required NPU quantization operators and dtypes are also checked
+before execution. A missing capability raises with `fallback: []`; use
+`fallback: [fp8, float]` only when precision fallback is intended. Runtime operator
+errors propagate without retrying at a different precision.
+
+The current contract covers one video with batch size 1, matching Q/K/V heads,
+and a power-of-two head dimension of at least 64. MindIE pads BSA internally to
+64; the dense MXFP4 512 sequence alignment restriction does not apply to BSA.
+Sparsity eligibility still controls whether a step runs sparse or dense. On dense
+steps, the dense FA contract and configured precision fallback apply. A precision
+skip keeps eligible sparse attention in BF16.
+
+Validate sparse BF16, FP8 and MXFP4 separately with identical prompts and seeds.
+These sparse comparisons do not replace the dense MXFP8/MXFP4 VBench acceptance
+runs. No NPU quality or performance result is implied by the configuration.

@@ -276,9 +276,9 @@ def test_sparse_unsupported_method_fallback(runtime, monkeypatch):
     call = Mock(side_effect=lambda q, k, v, **kw: q)
     monkeypatch.setattr(sys.modules["mindiesd"], "sparse_attention", call, raising=False)
     q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="sparse mxfp4"):
-        sparse(quant={"method": "mxfp4"}).forward_npu(q, q, q, video_metadata())
-    sparse(quant={"method": "mxfp4", "fallback": ["float"]}).forward_npu(q, q, q, video_metadata())
+    with pytest.raises(ValueError, match="sparse mxfp8"):
+        sparse(quant={"method": "mxfp8"}).forward_npu(q, q, q, video_metadata())
+    sparse(quant={"method": "mxfp8", "fallback": ["float"]}).forward_npu(q, q, q, video_metadata())
     assert call.call_args.kwargs["precision"] == "bf16"
 
 
@@ -429,3 +429,101 @@ def test_mxfp8_rejects_missing_fp8_dtype_in_both_modules(runtime, monkeypatch):
     with pytest.raises(ValueError, match="float8_e4m3fn"):
         flash("mxfp8").forward_npu(q, q, q)
     runtime.mxfp8_rotate_quant_fa.assert_not_called()
+
+
+@pytest.mark.parametrize("value", [-1, float("inf"), float("nan"), True])
+def test_sparse_mxfp4_invalid_range(value):
+    with pytest.raises(ValueError):
+        AttnQuantSpec(method="mxfp4", mxfp4_dst_type_max=value)
+
+
+def test_sparse_mxfp4_configuration():
+    spec = AttentionSpec(backend="RAINFUSION_ATTN", quant={"method": "mxfp4", "mxfp4_dst_type_max": 7.25})
+    assert spec.backend_kwargs()["quant"]["mxfp4_dst_type_max"] == 7.25
+    with pytest.raises(ValueError, match="RAINFUSION"):
+        AttentionSpec(backend="FLASH_ATTN", quant={"method": "mxfp4", "mxfp4_dst_type_max": 7.25})
+
+
+def test_sparse_mxfp4_v3_non_aligned_and_fallback(runtime, monkeypatch):
+    runtime.mxfp4_rotate_quant_bsa = Mock()
+    runtime.get_bsa_supported_precisions = Mock(return_value=("bf16", "fp8", "mxfp4"))
+    calls = []
+
+    def sparse_attention(q, k, v, *, precision="bf16", mxfp4_dst_type_max=0.0, mxfp4_scale_alg=None, **kwargs):
+        calls.append((precision, mxfp4_dst_type_max, mxfp4_scale_alg))
+        return q
+
+    monkeypatch.setattr(sys.modules["mindiesd"], "sparse_attention", sparse_attention, raising=False)
+    impl = sparse(quant={"method": "mxfp4", "fallback": ["fp8", "float"], "mxfp4_dst_type_max": 7.25})
+    q = torch.randn(1, 600, 2, 64, dtype=torch.bfloat16)
+    plan = rainfusion_attn.RainFusionPlan(used_len=600, prefix_len=0, latent_shape=(1, 20, 30))
+    assert impl._forward_sparse_npu(q, q, q, plan).shape == q.shape
+    assert calls[-1] == ("mxfp4", 7.25, None)
+    runtime.get_bsa_supported_precisions.return_value = ("bf16", "fp8")
+    impl._forward_sparse_npu(q, q, q, plan)
+    assert calls[-1][0] == "fp8"
+    runtime.get_bsa_supported_precisions.return_value = ("bf16",)
+    impl._forward_sparse_npu(q, q, q, plan)
+    assert calls[-1][0] == "bf16"
+    runtime.get_bsa_supported_precisions.return_value = ("bf16", "fp8", "mxfp4")
+
+    def fail(q, k, v, *, precision="bf16", mxfp4_dst_type_max=0.0, mxfp4_scale_alg=None, **kwargs):
+        raise RuntimeError("kernel failed")
+
+    monkeypatch.setattr(sys.modules["mindiesd"], "sparse_attention", fail)
+    with pytest.raises(RuntimeError, match="kernel failed"):
+        impl._forward_sparse_npu(q, q, q, plan)
+
+
+@pytest.mark.parametrize("missing", ["runtime", "probe", "dtype", "quant_op", "v3"])
+def test_sparse_mxfp4_missing_capability_is_preflight(runtime, monkeypatch, missing):
+    runtime.mxfp4_rotate_quant_bsa = Mock()
+    runtime.get_bsa_supported_precisions = Mock(return_value=("bf16", "fp8", "mxfp4"))
+    calls = []
+
+    def sparse_attention(q, k, v, *, precision="bf16", mxfp4_dst_type_max=0.0, mxfp4_scale_alg=None, **kwargs):
+        calls.append(precision)
+        return q
+
+    monkeypatch.setattr(sys.modules["mindiesd"], "sparse_attention", sparse_attention, raising=False)
+    if missing == "runtime":
+        del runtime.mxfp4_rotate_quant_bsa
+    elif missing == "probe":
+        del runtime.get_bsa_supported_precisions
+    elif missing == "dtype":
+        monkeypatch.delattr(sys.modules["torch_npu"], "float4_e2m1fn_x2")
+    elif missing == "quant_op":
+        monkeypatch.delattr(sys.modules["torch_npu"], "npu_dynamic_mx_quant")
+    else:
+        runtime.get_bsa_supported_precisions.return_value = ("bf16", "fp8")
+    q = torch.randn(1, 600, 2, 64, dtype=torch.bfloat16)
+    plan = rainfusion_attn.RainFusionPlan(used_len=600, prefix_len=0, latent_shape=(1, 20, 30))
+    with pytest.raises(ValueError, match="No supported RainFusion"):
+        sparse(quant={"method": "mxfp4"})._forward_sparse_npu(q, q, q, plan)
+    assert calls == []
+    sparse(quant={"method": "mxfp4", "fallback": ["float"]})._forward_sparse_npu(q, q, q, plan)
+    assert calls == ["bf16"]
+
+
+@pytest.mark.parametrize("batch,dim", [(2, 64), (1, 32), (1, 96)])
+def test_sparse_mxfp4_rejects_unvalidated_geometry(runtime, monkeypatch, batch, dim):
+    def sparse_attention(q, k, v, *, precision="bf16", **kwargs):
+        raise AssertionError("invalid geometry must not execute sparse attention")
+
+    monkeypatch.setattr(sys.modules["mindiesd"], "sparse_attention", sparse_attention, raising=False)
+    q = torch.randn(batch, 600, 2, dim, dtype=torch.bfloat16)
+    plan = rainfusion_attn.RainFusionPlan(used_len=600, prefix_len=0, latent_shape=(1, 20, 30))
+    with pytest.raises(ValueError, match="No supported RainFusion"):
+        sparse(quant={"method": "mxfp4"})._forward_sparse_npu(q, q, q, plan)
+
+
+@pytest.mark.parametrize("algorithm", [None, 0, 1, 2])
+def test_sparse_mxfp4_scale_algorithm(algorithm):
+    spec = AttentionSpec(backend="RAINFUSION_ATTN", quant={"method": "mxfp4", "mxfp4_scale_alg": algorithm})
+    assert spec.backend_kwargs()["quant"].get("mxfp4_scale_alg") == algorithm
+
+
+@pytest.mark.parametrize("algorithm", [-1, True, 1.0, "2"])
+def test_sparse_mxfp4_invalid_scale_algorithm(algorithm):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        AttnQuantSpec(method="mxfp4", mxfp4_scale_alg=algorithm)

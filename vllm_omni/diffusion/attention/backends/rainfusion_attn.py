@@ -502,7 +502,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             if method in ("float", "bf16"):
                 precision = "bf16"
                 break
-            if method not in ("fp8", "mix"):
+            if method not in ("fp8", "mix", "mxfp4"):
                 reason = f"sparse {method} is not supported"
             elif not _mindiesd_supports_precision():
                 reason = "MindIE-SD sparse_attention must explicitly support precision"
@@ -515,8 +515,34 @@ class RainFusionAttentionImpl(AttentionImpl):
                         from mindiesd.layers.flash_attn.quant_flash_attn import fp8_rotate_quant_bsa  # noqa: F401
                     except ImportError as exc:
                         reason = f"MindIE-SD FP8 BSA Runtime unavailable ({exc})"
-            if reason is None and method == "fp8":
-                reason = self.dense_fallback._quant_capability_reason("fp8", sparse=True)
+                    else:
+                        from mindiesd.layers.flash_attn import quant_flash_attn
+
+                        probe = getattr(quant_flash_attn, "get_bsa_supported_precisions", None)
+                        if callable(probe) and "fp8" not in probe():
+                            reason = "MindIE-SD FP8 BSA requires CANN BlockSparseAttention V2 or V3"
+            elif method == "mxfp4":
+                # Share block FP8 geometry checks, not dense MXFP4's 512 alignment.
+                reason = self.dense_fallback._quant_unsupported_reason("fp8", query, key, value, None)
+                if reason is None and query.shape[-1] < 64:
+                    reason = "MXFP4 BSA requires a power-of-two head dimension of at least 64"
+                if reason is None:
+                    try:
+                        from mindiesd.layers.flash_attn.quant_flash_attn import (
+                            get_bsa_supported_precisions,
+                            mxfp4_rotate_quant_bsa,
+                        )
+                    except ImportError as exc:
+                        reason = f"MindIE-SD MXFP4 BSA Runtime unavailable ({exc})"
+                    else:
+                        if not callable(mxfp4_rotate_quant_bsa) or "mxfp4" not in get_bsa_supported_precisions():
+                            reason = "MindIE-SD MXFP4 BSA requires CANN BlockSparseAttention V3"
+                if reason is None:
+                    parameters = inspect.signature(sparse_attention).parameters
+                    if not all(name in parameters for name in ("mxfp4_dst_type_max", "mxfp4_scale_alg")):
+                        reason = "MindIE-SD sparse_attention must explicitly support MXFP4 parameters"
+            if reason is None and method in ("fp8", "mxfp4"):
+                reason = self.dense_fallback._quant_capability_reason(method, sparse=True)
             if reason is None and extra.get("rotation_seed", self.quant.get("rotation_seed")) is not None:
                 if "rotation_seed" not in inspect.signature(sparse_attention).parameters:
                     reason = "this MindIE-SD sparse_attention does not support a custom rotation_seed"
@@ -543,6 +569,9 @@ class RainFusionAttentionImpl(AttentionImpl):
             "sparsity": self.rainfusion.sparsity,
             "precision": precision,
         }
+        if precision == "mxfp4":
+            common_kwargs["mxfp4_dst_type_max"] = self.quant.get("mxfp4_dst_type_max", 0.0)
+            common_kwargs["mxfp4_scale_alg"] = self.quant.get("mxfp4_scale_alg")
         rotation_seed = extra.get("rotation_seed", self.quant.get("rotation_seed"))
         if precision != "bf16" and rotation_seed is not None:
             common_kwargs["rotation_seed"] = rotation_seed

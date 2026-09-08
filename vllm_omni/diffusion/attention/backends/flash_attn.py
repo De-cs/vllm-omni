@@ -537,7 +537,7 @@ class FlashAttentionImpl(AttentionImpl):
         elif method == "mxfp4":
             dtypes = ("float4_e2m1fn_x2", "float8_e8m0fnu")
             npu_ops = ("npu_dynamic_mx_quant",)
-            mindie_ops = ("quant_flash_attn_metadata", "quant_flash_attn")
+            mindie_ops = ("block_sparse_attention",) if sparse else ("quant_flash_attn_metadata", "quant_flash_attn")
         else:
             return f"unsupported quantization method {method!r}"
         for name in dtypes:

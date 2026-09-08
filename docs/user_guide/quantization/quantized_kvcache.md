@@ -183,3 +183,13 @@ transition, interleaved requests, and offload when it is part of the deployment.
 Record selected precision/fallback warnings, software versions, generation
 settings, warmup and steady-state latency, and peak device memory. Unaligned
 or masked MXFP4 cases require the MindIE runtime fix before strict qualification.
+
+### RainFusion BSA MXFP4
+
+`RAINFUSION_ATTN` supports `quant.method: mxfp4` with a MindIE installation that
+reports CANN BlockSparseAttention V3 support. Use `quant.mxfp4_dst_type_max: 0.0`
+and `quant.mxfp4_scale_alg: null` for the default OCP setting, or an explicit
+range `7.25` for CX. These options belong to the sparse backend and do not enable
+Linear quantization. BSA uses internal 64 alignment rather than the dense FA
+512 guard. See [RainFusion BSA MXFP4](../diffusion/attention_backends/rainfusion.md#wan22-t2v-bsa-mxfp4)
+for configuration, precision fallback, rotation defaults and validation scope.
