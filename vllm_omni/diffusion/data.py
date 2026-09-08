@@ -1667,10 +1667,43 @@ class AttnQuantSpec:
     k_block_size: int = 16
     flashinfer_backend: str | None = None
 
+    # NPU method controls are separate from the existing GPU dtype controls.
+    method: str | None = None
+    fallback: list[str] = field(default_factory=list)
+    rotation_seed: int | None = None
+    skip_steps: str | list[int] | None = None
+    skip_layers: str | list[int] | None = None
+
+    _VALID_METHODS = frozenset({"float", "fp8", "mxfp8", "mxfp4"})
     _VALID_DTYPES = frozenset({"float16", "bfloat16", "int8", "fp8_e4m3"})
     _VALID_BLOCK_SIZES = frozenset({1, 4, 16})
 
     def __post_init__(self) -> None:
+        if self.method is not None:
+            if self.method not in self._VALID_METHODS:
+                raise ValueError(f"Unsupported attention quant.method={self.method!r}.")
+            if self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None:
+                raise ValueError("quant.method cannot be combined with dtype_qk/dtype_vo/flashinfer_backend.")
+            if self.q_block_size != 1 or self.k_block_size != 16:
+                raise ValueError("quant.method uses Runtime block sizes; do not set q_block_size/k_block_size.")
+        elif (
+            self.fallback
+            or self.rotation_seed is not None
+            or self.skip_steps is not None
+            or self.skip_layers is not None
+        ):
+            raise ValueError("fallback, rotation_seed and skip selectors require quant.method.")
+        if not isinstance(self.fallback, list) or any(m not in self._VALID_METHODS for m in self.fallback):
+            raise ValueError("quant.fallback must be a list of float/fp8/mxfp8/mxfp4 methods.")
+        chain = ([self.method] if self.method is not None else []) + self.fallback
+        if len(chain) != len(set(chain)) or ("float" in chain and chain[-1] != "float"):
+            raise ValueError("Quantization methods must be unique and float must be the last fallback.")
+        if self.rotation_seed is not None and (
+            isinstance(self.rotation_seed, bool) or not isinstance(self.rotation_seed, int)
+        ):
+            raise ValueError("quant.rotation_seed must be an integer.")
+        parse_kv_cache_skip_selector(self.skip_steps)
+        parse_kv_cache_skip_selector(self.skip_layers)
         for name, v in (("dtype_qk", self.dtype_qk), ("dtype_vo", self.dtype_vo)):
             if v is not None and v not in self._VALID_DTYPES:
                 raise ValueError(f"quant.{name}={v!r} unsupported; use one of {sorted(self._VALID_DTYPES)}.")
@@ -1683,7 +1716,7 @@ class AttnQuantSpec:
 
     @property
     def enabled(self) -> bool:
-        return self.dtype_qk is not None or self.dtype_vo is not None
+        return self.method is not None or self.dtype_qk is not None or self.dtype_vo is not None
 
 
 # Backends that select key blocks instead of attending densely, and so accept
@@ -1718,6 +1751,7 @@ class BlockSparseSpec:
 
     sparsity: float = 0.8
     start_step: int = 0
+    # Number of final steps kept dense, not an absolute end index.
     end_step: int = 0
     precision: str = RainFusionPrecision.BF16.value
     skip_layers: str | list[int] | None = None
@@ -1759,11 +1793,21 @@ class AttentionSpec:
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
                 "Remove skip_softmax or set backend to TRTLLM_ATTN."
             )
-        if self.quant is not None and self.backend.upper() not in ("TRTLLM_ATTN", "FLASHINFER_ATTN"):
-            raise ValueError(
-                f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
-                f"backend={self.backend!r}. Remove quant or set a supported backend."
+        if self.quant is not None:
+            allowed = (
+                ("FLASH_ATTN", "RAINFUSION_ATTN")
+                if self.quant.method is not None
+                else ("TRTLLM_ATTN", "FLASHINFER_ATTN")
             )
+            if self.backend.upper() not in allowed:
+                raise ValueError(
+                    f"quant is only supported by the {' and '.join(allowed)} backends "
+                    f"for these fields; got {self.backend!r}."
+                )
+        if self.quant is not None and self.quant.method is not None and self.block_sparse is not None:
+            precision = self.block_sparse.precision
+            if precision != "bf16" and precision != self.quant.method:
+                raise ValueError("Conflicting block_sparse.precision and quant.method; use quant.method alone.")
         if self.fastvideo_vsa_topk is not None:
             if self.backend.upper() != "FASTVIDEO_VSA":
                 raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
@@ -1798,7 +1842,12 @@ class AttentionSpec:
                 kw["target_sparsity"] = ss.target_sparsity
             if ss.disabled_until_timestep:
                 kw["disabled_until_timestep"] = ss.disabled_until_timestep
-        if self.quant is not None and self.quant.enabled:
+        if self.quant is not None and self.quant.method is not None:
+            q = self.quant
+            kw["quant"] = {"method": q.method, "fallback": list(q.fallback)}
+            if q.rotation_seed is not None:
+                kw["quant"]["rotation_seed"] = q.rotation_seed
+        elif self.quant is not None and self.quant.enabled:
             q = self.quant
             quant_kw: dict[str, Any] = {
                 "dtype_qk": q.dtype_qk,

@@ -4,7 +4,7 @@
 
 In DiT-based image and video generation, Flash Attention can take a large share
 of denoising time, especially for high-resolution or long-frame workloads.
-vLLM-Omni supports online FP8 quantization for eligible diffusion Flash
+vLLM-Omni integrates online FP8, MXFP8 and MXFP4 quantization for eligible diffusion Flash
 Attention (FA) to reduce FA latency while keeping model weights in their
 original dtype.
 
@@ -20,68 +20,46 @@ dynamically quantized before the attention operator. It does not quantize model
 weights and is separate from [FP8 W8A8](fp8.md), [Int8 W8A8](int8.md), or
 pre-quantized checkpoint formats.
 
-If `diffusion_kv_cache_dtype` is not set, behavior is unchanged and attention
-runs in the native dtype.
+When neither the legacy dtype flag nor a per-role `quant.method` is set,
+attention uses its existing precision.
 
 ## Hardware Support
 
-| Device | FP8 FA |
-|--------|--------|
-| Ascend NPU | ✅ |
-| NVIDIA GPU | ❌ |
-| AMD ROCm | ❌ |
-| Intel XPU | ❌ |
+The quantized MindIE-SD paths require Ascend A5 (950), a compatible
+`torch_npu`, and a MindIE-SD build exporting the selected runtime function.
+The adapter checks the device family, dtype symbols and required operators
+before executing a quantized candidate. NVIDIA GPU, AMD ROCm and Intel XPU do
+not use this adapter.
 
-Legend: `✅` supported, `❌` unsupported.
+Explicit unsupported NPU methods raise; alternatives run only when listed in
+`quant.fallback`. [RainFusion](../diffusion/attention_backends/rainfusion.md)
+also supports FP8 sparse attention and independently controls when to return to
+dense attention. Hardware numerical and performance qualification remains
+required for each runtime build.
 
-FP8 FA is currently implemented only for the NPU Flash Attention backend. Other
-backends do not support `diffusion_kv_cache_dtype="fp8"` for diffusion attention
-and fall back to native dtype execution.
+## Model scope
 
-## Model Type Support
+The integration and acceptance scope is **Wan2.2 T2V A14B**. Self-attention
+uses the selected FA method; cross-attention retains its model-level opt-out.
+Linear layers and checkpoint loading keep their existing behavior. Do not set
+`--quantization mxfp8` or `--quantization mxfp4` to enable this FA feature: those
+options select separate weight/Linear quantization methods.
 
-### Diffusion Model
-
-| Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
-| Wan2.2 | Eligible DiT full-attention FA on Ascend NPU | Tested | Compare quality and latency against a BF16 baseline before production use |
-| Other diffusion models | Eligible DiT full-attention FA on Ascend NPU | Not tested | You can try `diffusion_kv_cache_dtype="fp8"`; tune `diffusion_kv_cache_skip_steps` and `diffusion_kv_cache_skip_layers` when higher precision is needed |
-
-### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
-
-Not tested for FP8 FA. Treat any use as experimental unless a model-specific
-guide documents support.
-
-### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
-
-Not tested. If the diffusion stage uses the same NPU Flash Attention backend,
-`diffusion_kv_cache_dtype` may apply in theory; validate quality and latency for
-each stage and model.
+I2V, S2V, VACE and other model-specific pipelines are outside this qualification.
 
 ## Configuration
 
-Offline diffusion example:
+Online serving with strict MXFP8 FA (no precision fallback):
 
 ```bash
-python examples/offline_inference/image_to_video/image_to_video.py \
-    --model <your-wan2.2-model> \
-    --prompt "A cat sitting on a surfboard at the beach" \
-    --height 1280 \
-    --width 720 \
-    --num-frames 61 \
-    --num-inference-steps 4 \
-    --ulysses-degree 4 \
-    --vae-patch-parallel-size 4 \
-    --diffusion-kv-cache-dtype fp8 \
-    --diffusion-kv-cache-skip-steps "0,1" \
-    --diffusion-kv-cache-skip-layers "0-2"
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
+    --diffusion-kv-cache-dtype mxfp8
 ```
 
-Online serving:
-
-```bash
-vllm serve <your-model> --omni --diffusion-kv-cache-dtype fp8
-```
+Use `--diffusion-kv-cache-dtype mxfp4` for strict MXFP4, subject to the current
+runtime restrictions below. The existing T2V Python API accepts these settings
+through `Omni` engine keyword arguments (`diffusion_kv_cache_dtype`,
+`diffusion_kv_cache_skip_steps`, and `diffusion_kv_cache_skip_layers`).
 
 Deploy config:
 
@@ -104,13 +82,13 @@ The legacy keyword aliases `kv_cache_dtype`, `kv_cache_skip_steps`, and
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `diffusion_kv_cache_dtype` | str \| None | `None` | Set to `"fp8"` to enable dynamic FP8 FA on supported attention backends |
+| ----------- | ------ | --------- | ------------- |
+| `diffusion_kv_cache_dtype` | str \| None | `None` | NPU method: `fp8`, `mxfp8`, `mxfp4`; `float` disables quantization and `auto` leaves the default unchanged |
 | `diffusion_kv_cache_skip_steps` | str \| None | `None` | Denoising step selector to keep in native dtype, for example `"0,1,4-6"` |
 | `diffusion_kv_cache_skip_layers` | str \| None | `None` | Transformer layer selector to keep in native dtype, for example `"0-2,10"` |
 
 Selectors use comma-separated integers and inclusive ranges. Listed steps or
-layers skip FP8 FA; all other eligible full-attention forwards use the FP8 path.
+layers skip quantized FA; other eligible full-attention forwards use the selected method.
 
 ## Validation and Notes
 
@@ -123,3 +101,85 @@ layers skip FP8 FA; all other eligible full-attention forwards use the FP8 path.
 4. Report both latency and quality results when enabling this option for a new
    model. For image or video models, include visual comparison and quantitative
    metrics when available, such as PSNR or SSIM.
+
+## Per-role MindIE-SD Runtime configuration
+
+```yaml
+diffusion_attention_config:
+  per_role:
+    self:
+      backend: FLASH_ATTN
+      quant:
+        method: mxfp4
+        fallback: [mxfp8, float]
+        skip_steps: "0-1,48-49"
+        skip_layers: "0,39"
+    cross:
+      backend: FLASH_ATTN
+      quant:
+        method: float
+```
+
+`float` means unquantized attention in the input dtype, not a cast to FP32.
+Fallback is ordered, contains no duplicates, and ends at `float` if present.
+Known unsupported geometry, hardware or missing runtime/dtype/operator symbols
+can select a configured fallback; operator execution errors propagate without retrying another method.
+Contradictory legacy dtype and per-role methods are rejected. Legacy and per-role
+skip selectors are combined; a skip disables quantization regardless of fallback.
+Wan cross-attention retains its model-level quantization opt-out.
+
+Models must declare `BSND` or `BNSD`; the adapter passes tensors without an
+unconditional transpose. Quantized calls require BF16/FP16 four-dimensional
+Q/K/V. The current block-FP8 Runtime requires batch size 1 and equal head counts;
+FP8/MXFP8 generated rotations require a power-of-two head dimension. Packed,
+varlen and piecewise calls are outside the quantized contract. Float fallback also
+requires a supported packed path or an explicit mask preserving visibility. Boolean Omni masks
+use True for allowed attention and are converted to CANN's blocked-mask convention.
+With the current MindIE MXFP4 runtime, **both Q and K/V sequence lengths must
+be multiples of 512, and caller-supplied masks are rejected**. Its internal
+padding currently changes the effective softmax length; returning cropped output
+does not correct that error. Configure MXFP8/FP8/float fallback for unsupported
+calls, or use strict mode to fail visibly. These guards can be relaxed only
+after the MindIE valid-length and mask contract is fixed and verified. An entire
+MXFP4 run may otherwise fall back, so a successful generation alone does not
+establish MXFP4 coverage. Ring SP is unsupported; validate Ulysses including padding.
+
+The required MindIE build exports the selected function from
+`mindiesd.layers.flash_attn.quant_flash_attn`: `fp8_rotate_quant_fa`,
+`mxfp8_rotate_quant_fa`, or `mxfp4_quant_fa`. Dense FP8/MXFP8 explicitly use rotation
+seed `425500`, overridable by `quant.rotation_seed`. This is independent of the
+video generation seed. MXFP4 does not generate rotations and receives no seed.
+There is no production copy of rotation, quantization or FA kernels in Omni.
+
+## Runtime migration validation
+
+Run the CPU contract tests in an Omni development environment:
+
+```bash
+pytest tests/diffusion/attention/test_mindie_runtime.py \
+  tests/diffusion/attention/test_rainfusion_plan.py \
+  tests/diffusion/models/wan2_2/test_wan22_mindie_metadata.py \
+  tests/platforms/npu/quant/test_kv_quant_npu.py
+```
+
+## Wan2.2 T2V A14B acceptance
+
+Compare three runs using the same unquantized checkpoint and Linear layers:
+native BF16/FP16 FA, MXFP8 FA, and MXFP4 FA. Use the same prompts, negative
+prompts, seeds, resolution, frame count, denoising steps, guidance, scheduler,
+parallelism and high/low-noise expert boundary. Run both quantized modes with
+`fallback: []` first; report any intentionally skipped steps/layers as part of
+the configuration. Test the fallback chain separately so it cannot hide missing
+MXFP4 execution during qualification.
+
+The target is a VBench score difference of at most 1% for each quantized FA
+mode against the same native-precision baseline. Before measurement, fix the
+VBench version, prompt set, score aggregation and whether 1% means relative
+change or percentage points. No VBench or NPU performance result is claimed by
+the CPU contract tests.
+
+On NPU, cover TP=1/2 local head counts, Ulysses with padding, the two-expert
+transition, interleaved requests, and offload when it is part of the deployment.
+Record selected precision/fallback warnings, software versions, generation
+settings, warmup and steady-state latency, and peak device memory. Unaligned
+or masked MXFP4 cases require the MindIE runtime fix before strict qualification.

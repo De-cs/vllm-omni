@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) Microsoft Corporation and Jiarui Fang
 # SPDX-License-Identifier: Apache-2.0
 # DeepSpeed Team & Jiarui Fang
@@ -191,7 +191,7 @@ class Attention(nn.Module):
         self._kv_cache_skip_layers: set[int] | None = None
         # Per-layer opt-out from KV-cache quantization (set by model author).
         self._disable_kv_quant: bool = disable_kv_quant
-        self._init_kv_cache_quantization(config)
+        self._init_kv_cache_quantization(config, spec)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         """Return native rank-local geometry for an opted-in paged cache."""
@@ -227,15 +227,30 @@ class Attention(nn.Module):
                 return self._no_parallel_strategy
         return self.parallel_strategy
 
-    def _init_kv_cache_quantization(self, config) -> None:
+    def _init_kv_cache_quantization(self, config, spec=None) -> None:
+        from vllm_omni.diffusion.data import parse_kv_cache_skip_selector
+
+        self._quant_fallback = ()
+        self._rotation_seed = None
+        self._explicit_quant_method = False
         if config is None:
             return
         dtype = getattr(config, "diffusion_kv_cache_dtype", None)
         if dtype == "auto":
             dtype = None
+        quant = getattr(spec, "quant", None)
+        if quant is not None and quant.method is not None:
+            if not current_omni_platform.is_npu():
+                raise ValueError("Attention quant.method is currently supported only on NPU.")
+            if dtype is not None and dtype != quant.method:
+                raise ValueError("Conflicting diffusion_kv_cache_dtype and per-role quant.method.")
+            dtype = quant.method
+            self._explicit_quant_method = True
+            self._quant_fallback = tuple(quant.fallback)
+            self._rotation_seed = quant.rotation_seed
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
-        if dtype:
+        if dtype and dtype != "float":
             if ring_degree > 1:
                 raise ValueError(
                     "KV quantization is not compatible with ring attention "
@@ -244,6 +259,10 @@ class Attention(nn.Module):
                 )
             platform_key = current_omni_platform.device_name
             if not self.attention.supports_kv_cache_dtype(dtype, platform_key):
+                if platform_key == "npu" or self._explicit_quant_method:
+                    raise ValueError(
+                        f"{self.attn_backend.get_name()} does not support attention quantization {dtype!r}."
+                    )
                 logger.warning_once(
                     "Attention backend %s does not support kv_cache_dtype='%s' on %s. "
                     "KV quantization will be disabled.",
@@ -255,13 +274,20 @@ class Attention(nn.Module):
         self._kv_cache_dtype = dtype
         self._kv_cache_skip_steps = getattr(config, "diffusion_kv_cache_skip_step_indices", None)
         self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
+        if quant is not None and quant.method is not None:
+            self._kv_cache_skip_steps = (self._kv_cache_skip_steps or set()) | (
+                parse_kv_cache_skip_selector(quant.skip_steps) or set()
+            )
+            self._kv_cache_skip_layers = (self._kv_cache_skip_layers or set()) | (
+                parse_kv_cache_skip_selector(quant.skip_layers) or set()
+            )
 
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps
         skip_layers = self._kv_cache_skip_layers
         if skip_steps is not None:
             step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
-            if step_idx is not None and step_idx in skip_steps:
+            if skip_steps and (step_idx is None or step_idx in skip_steps):
                 return False
         if skip_layers is not None:
             if self.layer_idx is not None and self.layer_idx in skip_layers:
@@ -269,18 +295,21 @@ class Attention(nn.Module):
         return True
 
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
-        kv_cache_dtype = self._kv_cache_dtype
-        if kv_cache_dtype is None or self._disable_kv_quant or not self._should_apply_kv_cache_quant():
-            if attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra:
-                return attn_metadata
-            extra = dict(attn_metadata.extra)
-            extra.pop("kv_cache_dtype", None)
-            return replace(attn_metadata, extra=extra)
-
+        disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
+        dtype = self._kv_cache_dtype
+        extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
+        # Recompute per forward so shared metadata cannot retain another step's policy.
+        for name in ("kv_cache_dtype", "quant_fallback", "rotation_seed", "disable_attention_quant"):
+            extra.pop(name, None)
+        if disabled or dtype == "float":
+            extra["disable_attention_quant"] = True
+        elif dtype is not None:
+            extra["kv_cache_dtype"] = dtype
+            extra["quant_fallback"] = getattr(self, "_quant_fallback", ())
+        if not disabled and getattr(self, "_rotation_seed", None) is not None:
+            extra["rotation_seed"] = self._rotation_seed
         if attn_metadata is None:
-            return AttentionMetadata(extra={"kv_cache_dtype": kv_cache_dtype})
-        extra = dict(attn_metadata.extra)
-        extra["kv_cache_dtype"] = kv_cache_dtype
+            return AttentionMetadata(extra=extra) if extra else None
         return replace(attn_metadata, extra=extra)
 
     def forward(
@@ -386,6 +415,9 @@ class Attention(nn.Module):
         self._assert_piecewise_compatible(attn_metadata)
 
         if query.dtype == torch.float32:
+            extra = attn_metadata.extra if attn_metadata else {}
+            if extra.get("kv_cache_dtype") and "float" not in extra.get("quant_fallback", ()):
+                raise ValueError("Float32 inputs require an explicit float fallback for attention quantization.")
             logger.warning_once(
                 f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
                 f"attention_backend='{self.backend_pref}' to 'sdpa' for dtype={query.dtype}."
