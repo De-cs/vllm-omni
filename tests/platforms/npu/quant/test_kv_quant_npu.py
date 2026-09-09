@@ -71,19 +71,35 @@ def test_compatibility_wrapper_delegates(monkeypatch, layout, shape):
     from unittest.mock import Mock
 
     runtime = Mock(side_effect=lambda q, k, v, **kwargs: q)
-    module = ModuleType("mindiesd.layers.flash_attn.quant_flash_attn")
-    module.fp8_rotate_quant_fa = runtime
+    module = ModuleType("mindiesd")
+    module.quant_attention_forward = runtime
     monkeypatch.setitem(sys.modules, module.__name__, module)
     q = torch.randn(shape, dtype=torch.bfloat16)
     assert kv_quant_npu.fp8_rotate_quant_fa(q, q, q, layout=layout, softmax_scale=0.25) is q
     assert runtime.call_args.args[0] is q
-    assert runtime.call_args.kwargs == {"layout": layout, "softmax_scale": 0.25, "rotation_seed": 425500}
+    kwargs = runtime.call_args.kwargs
+    assert kwargs["layout"] == layout and kwargs["scale"] == 0.25 and kwargs["precision"] == "fp8"
+    assert kwargs["q_rot"] is kwargs["k_rot"]
+    torch.testing.assert_close(
+        kwargs["q_rot"], kv_quant_npu.get_quant_attention_rotation(q.device, q.dtype, 64, 425500)
+    )
+
+
+def test_rotation_is_seeded_orthogonal_cached_and_preserves_rng():
+    kv_quant_npu.get_quant_attention_rotation.cache_clear()
+    before = torch.random.get_rng_state()
+    rot = kv_quant_npu.get_quant_attention_rotation(torch.device("cpu"), torch.float32, 64, 425500)
+    assert rot is kv_quant_npu.get_quant_attention_rotation(torch.device("cpu"), torch.float32, 64, 425500)
+    torch.testing.assert_close(rot @ rot.T, torch.eye(64))
+    assert torch.equal(before, torch.random.get_rng_state())
+    other = kv_quant_npu.get_quant_attention_rotation(torch.device("cpu"), torch.float32, 64, 12)
+    assert not torch.equal(rot, other)
 
 
 @npu_smoke
 @pytest.mark.parametrize("layout", ["BSND", "BNSD"])
 def test_fp8_rotate_quant_fa_real_npu_shape_contract(layout):
-    pytest.importorskip("mindiesd.layers.flash_attn.quant_flash_attn")
+    pytest.importorskip("mindiesd")
     query = torch.randn(1, 256, 2, 64, dtype=torch.float16, device="npu")
     if layout == "BNSD":
         query = query.transpose(1, 2)

@@ -1731,10 +1731,12 @@ class RainFusionPrecision(StrEnum):
     ``fp8``: BSA FP8 path - Hadamard rotation then full FP8 block quantization
         of Q/K/V before the BSA kernel.
     ``mix``: EagleQBSA mixed precision - Q/K per-block INT8 + V per-channel FP8.
+    ``mxfp4``: BSA MXFP4 path provided by MindIE-SD rf_v3.
     """
 
     BF16 = "bf16"
     FP8 = "fp8"
+    MXFP4 = "mxfp4"
     MIX = "mix"
 
 

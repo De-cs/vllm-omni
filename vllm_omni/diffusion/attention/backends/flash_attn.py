@@ -496,20 +496,11 @@ class FlashAttentionImpl(AttentionImpl):
 
     @staticmethod
     def _load_quant_runtime(method):
-        # Import only the selected concrete function, and only inside NPU execution.
-        if method == "fp8":
-            from mindiesd.layers.flash_attn.quant_flash_attn import fp8_rotate_quant_fa
+        if method not in ("fp8", "mxfp8", "mxfp4"):
+            raise ValueError(f"Unsupported NPU attention quantization method {method!r}.")
+        from mindiesd import quant_attention_forward
 
-            return fp8_rotate_quant_fa
-        if method == "mxfp8":
-            from mindiesd.layers.flash_attn.quant_flash_attn import mxfp8_rotate_quant_fa
-
-            return mxfp8_rotate_quant_fa
-        if method == "mxfp4":
-            from mindiesd.layers.flash_attn.quant_flash_attn import mxfp4_quant_fa
-
-            return mxfp4_quant_fa
-        raise ValueError(f"Unsupported NPU attention quantization method {method!r}.")
+        return quant_attention_forward
 
     def _quant_unsupported_reason(self, method, query, key, value, attn_metadata):
         layout = self.qkv_layout
@@ -536,28 +527,15 @@ class FlashAttentionImpl(AttentionImpl):
         dim = query.shape[-1]
         if method in ("fp8", "mxfp8") and (dim == 0 or dim & (dim - 1)):
             return "generated Hadamard rotations require a power-of-two head dimension"
-        if method == "fp8" and (query.shape[0] != 1 or query.shape[head_axis] != key.shape[head_axis]):
-            return "block-FP8 Runtime requires batch size 1 and equal Q/K/V head counts"
+        if method == "fp8" and query.shape[0] != 1:
+            return "block-FP8 Runtime requires batch size 1"
+        if method == "mxfp8" and query.shape != key.shape:
+            return "MXFP8 quant_attention_forward requires equal Q/K/V shapes"
         mask = attn_metadata.attn_mask if attn_metadata else None
         if mask is not None:
-            if mask.dtype != torch.bool:
-                return "quantized FA requires a boolean keep mask"
-            q_len, k_len = query.shape[seq_axis], key.shape[seq_axis]
-            if mask.ndim == 2 and tuple(mask.shape) not in ((query.shape[0], k_len), (q_len, k_len)):
-                return "invalid two-dimensional attention mask shape"
-            if mask.ndim not in (2, 4):
-                return "quantized FA supports only two- or four-dimensional masks"
-            if mask.ndim == 4 and (
-                mask.shape[0] not in (1, query.shape[0])
-                or mask.shape[1] not in (1, query.shape[head_axis])
-                or mask.shape[2] not in (1, q_len)
-                or mask.shape[3] != k_len
-            ):
-                return "invalid four-dimensional attention mask shape"
-            if method == "mxfp8" and query.shape[0] != 1:
-                return "masked batched MXFP8 TND attention is not supported"
-            if method == "mxfp4" and (query.shape[seq_axis] % 128 or key.shape[seq_axis] % 128):
-                return "masked MXFP4 requires sequence lengths aligned to 128"
+            # The minimal public quantized API has no qualified caller-mask path.
+            # Keep the original mask intact for an explicitly configured float fallback.
+            return "caller masks require the float attention path"
         return None
 
     def forward_fa_quant_npu(self, query, key, value, attn_metadata=None):
@@ -582,17 +560,14 @@ class FlashAttentionImpl(AttentionImpl):
                     ) from exc
                 reasons.append(f"{candidate}: MindIE-SD Runtime unavailable ({exc})")
                 continue
-            mask = attn_metadata.attn_mask if attn_metadata else None
-            if mask is not None:
-                # Omni uses True=keep. The quant Runtime passes its mask directly
-                # to CANN, which uses True=blocked (unlike attention_forward).
-                q_bsnd = query if self.qkv_layout == "BSND" else query.transpose(1, 2)
-                k_bsnd = key if self.qkv_layout == "BSND" else key.transpose(1, 2)
-                mask = ~_maybe_reshape_attn_mask(q_bsnd, k_bsnd, mask, mask_mode="full_qk")
-            kwargs = dict(layout=self.qkv_layout, attn_mask=mask, softmax_scale=self.softmax_scale)
-            # MXFP4 does not generate rotations or accept rotation_seed.
+            kwargs = dict(precision=candidate, layout=self.qkv_layout, scale=self.softmax_scale)
+            # The function does not generate rotations. Retain Omni's existing FP8/MXFP8 policy.
             if candidate in ("fp8", "mxfp8"):
-                kwargs["rotation_seed"] = extra.get("rotation_seed", self.quant.get("rotation_seed", 425500))
+                from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
+
+                seed = extra.get("rotation_seed", self.quant.get("rotation_seed", 425500))
+                rotation = get_quant_attention_rotation(query.device, query.dtype, query.shape[-1], seed)
+                kwargs.update(q_rot=rotation, k_rot=rotation)
             if reasons:
                 logger.warning_once("NPU attention falling back to %s: %s", candidate, "; ".join(reasons))
             logger.info_once("NPU attention uses MindIE-SD %s Runtime, layout=%s.", candidate, self.qkv_layout)
@@ -687,6 +662,7 @@ class FlashAttentionImpl(AttentionImpl):
             value,
             attn_mask=attention_mask,
             scale=self.softmax_scale,
+            head_first=layout == "BNSD",
             opt_mode="manual",
             op_type="fused_attn_score",
             layout=layout,

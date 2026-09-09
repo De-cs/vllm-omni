@@ -502,19 +502,14 @@ class RainFusionAttentionImpl(AttentionImpl):
             if method in ("float", "bf16"):
                 precision = "bf16"
                 break
-            if method not in ("fp8", "mix"):
+            if method not in ("fp8", "mxfp4", "mix"):
                 reason = f"sparse {method} is not supported"
             elif not _mindiesd_supports_precision():
                 reason = "MindIE-SD sparse_attention must explicitly support precision"
             elif plan.video_spans is not None:
                 reason = "quantized multi-video RainFusion is not supported"
-            elif method == "fp8":
-                reason = self.dense_fallback._quant_unsupported_reason("fp8", query, key, value, None)
-                if reason is None:
-                    try:
-                        from mindiesd.layers.flash_attn.quant_flash_attn import fp8_rotate_quant_bsa  # noqa: F401
-                    except ImportError as exc:
-                        reason = f"MindIE-SD FP8 BSA Runtime unavailable ({exc})"
+            elif method in ("fp8", "mxfp4"):
+                reason = self.dense_fallback._quant_unsupported_reason(method, query, key, value, None)
             if reason is None and extra.get("rotation_seed", self.quant.get("rotation_seed")) is not None:
                 if "rotation_seed" not in inspect.signature(sparse_attention).parameters:
                     reason = "this MindIE-SD sparse_attention does not support a custom rotation_seed"

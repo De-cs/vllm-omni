@@ -110,20 +110,20 @@ Denoise indices continue across the high/low-noise transformer boundary.
 Precision and sparsity are independent: quantization skips use sparse BF16
 when sparse geometry remains eligible; sparse skips use dense FA with the same
 configured quantization chain. `quant.method=float` disables quantization.
-Sparse MXFP4/MXFP8 are not implemented: list `fp8` or `float` fallback explicitly
-if those methods are selected for a RainFusion role. Legacy
-`block_sparse.precision=bf16/fp8/mix` remains supported; without a `quant` spec its
+Sparse MXFP4 uses MindIE-SD's existing `rf_v3` path. Sparse MXFP8 is unsupported:
+list `fp8` or `float` fallback explicitly if selected for a RainFusion role. Legacy
+`block_sparse.precision=bf16/fp8/mxfp4/mix` remains supported; without a `quant` spec its
 dense fallback remains unquantized unless a legacy diffusion dtype is set.
 
 Single-video quantized calls explicitly use `sparse_type=rf_v3` and require
-`sparse_attention(precision=...)`; FP8 additionally requires the
-`fp8_rotate_quant_bsa` Runtime symbol. BF16 keeps the existing `rf_v2` route.
+`sparse_attention(precision=...)`. No private `quant_flash_attn` module or separate
+BSA Runtime symbol is required. BF16 keeps the existing `rf_v2` route.
 A single-video model does not require `video_spans` support. Multi-video geometry
 checks that capability at execution; quantized multi-video attention remains
 unsupported unless a configured `float` fallback selects sparse BF16.
 
-Sparse rotation defaults remain owned by MindIE (currently seed 1234 in the
-Runtime). An explicit `quant.rotation_seed` is accepted only when the high-level
+Sparse rotation defaults remain owned by MindIE (standard Hadamard in the current
+`dev` implementation). An explicit `quant.rotation_seed` is accepted only when the high-level
 sparse API exposes that parameter; otherwise it requires a configured precision
 fallback or raises. Dense FP8/MXFP8 uses Omni's legacy seed 425500. Do not assume
 these two paths have identical numerical baselines.
