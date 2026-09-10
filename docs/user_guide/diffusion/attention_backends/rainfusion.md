@@ -116,8 +116,16 @@ list `fp8` or `float` fallback explicitly if selected for a RainFusion role. Leg
 dense fallback remains unquantized unless a legacy diffusion dtype is set.
 
 Single-video quantized calls explicitly use `sparse_type=rf_v3` and require
-`sparse_attention(precision=...)`. No private `quant_flash_attn` module or separate
-BSA Runtime symbol is required. BF16 keeps the existing `rf_v2` route.
+`sparse_attention(precision=...)`. FP8/MXFP4 also require the public read-only
+`mindiesd.get_bsa_supported_precisions()` query: native operator version and
+schema must advertise the selected precision before it is dispatched. Missing
+capability selects only an explicitly configured fallback; execution errors are
+never retried. This check is independent of Dense FIA constraints. Quantized
+Wan BSA currently requires batch size one: RFv3 FP8 squeezes the batch before
+block quantization, and larger MXFP4 batches are outside this integration's
+qualified scope. Explicit `float` fallback still selects unquantized BSA.
+No private `quant_flash_attn` module or separate BSA Runtime execution symbol is
+required. BF16 keeps the existing `rf_v2` route.
 A single-video model does not require `video_spans` support. Multi-video geometry
 checks that capability at execution; quantized multi-video attention remains
 unsupported unless a configured `float` fallback selects sparse BF16.

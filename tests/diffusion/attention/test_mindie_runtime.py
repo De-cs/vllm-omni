@@ -25,15 +25,17 @@ def runtime(monkeypatch):
         return q
 
     mod.quant_attention_forward = Mock(side_effect=execute)
+    mod.get_bsa_supported_precisions = lambda: ("bf16", "fp8", "mxfp4")
     monkeypatch.setitem(sys.modules, mod.__name__, mod)
     for module in (flash_attn, layer_mod):
         monkeypatch.setattr(module, "current_omni_platform", SimpleNamespace(is_npu=lambda: True, device_name="npu"))
     monkeypatch.setattr(flash_attn, "get_current_diffusion_config_or_none", lambda: None)
     monkeypatch.setattr(rainfusion_attn, "get_current_diffusion_config_or_none", lambda: None)
     monkeypatch.setattr(rainfusion_attn, "is_forward_context_available", lambda: False)
-    rainfusion_attn._mindiesd_supports_precision.cache_clear()
+    supports_precision = rainfusion_attn._mindiesd_supports_precision
+    supports_precision.cache_clear()
     yield mod
-    rainfusion_attn._mindiesd_supports_precision.cache_clear()
+    supports_precision.cache_clear()
 
 
 def flash(method="mxfp8", fallback=(), layout="BSND"):
@@ -326,3 +328,122 @@ def test_sparse_model_padding_mask_is_equivalent_to_trimming(runtime):
     metadata = video_metadata(attn_mask_is_padding=True)
     metadata.attn_mask = torch.arange(4224)[None] < 4096
     assert sparse()._resolve_plan(metadata).used_len == 4096
+
+
+@pytest.mark.parametrize("method", ["fp8", "mxfp4"])
+def test_bsa_precheck_is_independent_of_dense_fia(runtime, monkeypatch, method):
+    def execute(q, k, v, *, precision="bf16", **kwargs):
+        return q
+
+    runtime.sparse_attention = Mock(wraps=execute)
+    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
+    q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
+    impl = sparse(quant={"method": method})
+    impl.dense_fallback._quant_unsupported_reason = Mock(side_effect=AssertionError("dense precheck called"))
+    assert impl.forward_npu(q, q, q, video_metadata()) is not None
+    assert runtime.sparse_attention.call_args.kwargs["precision"] == method
+
+
+@pytest.mark.parametrize("available,expected", [(('bf16', 'fp8'), 'fp8'), (('bf16',), 'bf16')])
+def test_bsa_native_capability_selects_configured_chain(runtime, monkeypatch, available, expected):
+    def execute(q, k, v, *, precision="bf16", **kwargs):
+        return q
+
+    runtime.sparse_attention = Mock(wraps=execute)
+    runtime.get_bsa_supported_precisions = lambda: available
+    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
+    q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
+    sparse(quant={"method": "mxfp4", "fallback": ["fp8", "float"]}).forward_npu(q, q, q, video_metadata())
+    assert runtime.sparse_attention.call_args.kwargs["precision"] == expected
+    runtime.sparse_attention.assert_called_once()
+    runtime.quant_attention_forward.assert_not_called()
+
+
+def test_bsa_missing_capability_query_is_not_assumed_supported(runtime, monkeypatch):
+    runtime.sparse_attention = Mock()
+    del runtime.get_bsa_supported_precisions
+    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
+    q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="get_bsa_supported_precisions"):
+        sparse(quant={"method": "fp8"}).forward_npu(q, q, q, video_metadata())
+    runtime.sparse_attention.assert_not_called()
+
+
+def test_bsa_operator_failure_never_retries(runtime, monkeypatch):
+    runtime.sparse_attention = Mock(side_effect=RuntimeError("BSA operator failure"))
+    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
+    q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="BSA operator failure"):
+        sparse(quant={"method": "mxfp4", "fallback": ["fp8", "float"]}).forward_npu(q, q, q, video_metadata())
+    runtime.sparse_attention.assert_called_once()
+
+
+def test_layer_selector_requires_index_except_cross_optout(runtime, monkeypatch):
+    layer = make_layer(runtime, monkeypatch)
+    layer.layer_idx = None
+    config = SimpleNamespace(diffusion_kv_cache_dtype=None, parallel_config=SimpleNamespace(ring_degree=1))
+    spec = AttentionSpec(backend="FLASH_ATTN", quant={"method": "mxfp8", "skip_layers": "0,3"})
+    with pytest.raises(ValueError, match="parseable transformer block index"):
+        layer._init_kv_cache_quantization(config, spec)
+    layer._disable_kv_quant = True
+    layer._init_kv_cache_quantization(config, spec)
+    assert layer._with_kv_cache_dtype(None).extra["disable_attention_quant"]
+
+
+@pytest.mark.parametrize("prefix", ["transformer.blocks.3.attn1", "transformer_2.blocks.3.attn1"])
+@pytest.mark.parametrize("method", ["fp8", "mxfp4"])
+def test_expert_layer_and_step_skip_remain_sparse(runtime, monkeypatch, prefix, method):
+    def execute(q, k, v, *, precision="bf16", **kwargs):
+        return q
+
+    runtime.sparse_attention = Mock(wraps=execute)
+    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
+    layer = make_layer(runtime, monkeypatch)
+    layer.layer_idx = rainfusion_attn._try_extract_layer_index(prefix)
+    assert layer.layer_idx == 3
+    config = SimpleNamespace(diffusion_kv_cache_dtype=None, parallel_config=SimpleNamespace(ring_degree=1))
+    spec = AttentionSpec(backend="RAINFUSION_ATTN", quant={"method": method, "skip_layers": "3", "skip_steps": "0"})
+    impl = sparse(quant={"method": method})
+    layer.attention = impl
+    layer.attn_backend = rainfusion_attn.RainFusionAttentionBackend
+    layer._init_kv_cache_quantization(config, spec)
+    ctx = SimpleNamespace(denoise_step_idx=0)
+    monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(layer_mod, "get_forward_context", lambda: ctx)
+    source = video_metadata(kv_cache_dtype="mxfp8", disable_attention_quant=True)
+    q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
+    for layer_idx, step, expected in ((3, 0, "bf16"), (3, 2, "bf16"), (4, 0, "bf16"), (4, 2, method), (4, 0, "bf16")):
+        layer.layer_idx = layer_idx
+        ctx.denoise_step_idx = step
+        metadata = layer._with_kv_cache_dtype(source)
+        impl.forward_npu(q, q, q, metadata)
+        assert runtime.sparse_attention.call_args.kwargs["precision"] == expected
+    runtime.quant_attention_forward.assert_not_called()
+    assert source.extra["kv_cache_dtype"] == "mxfp8"
+
+
+@pytest.mark.parametrize("method", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("head_dim", [32, 96])
+def test_bsa_unsupported_rotation_shape_uses_float_sparse(runtime, monkeypatch, method, head_dim):
+    runtime.sparse_attention = Mock(side_effect=lambda q, k, v, **kwargs: q)
+    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
+    q = torch.randn(1, 4096, 2, head_dim, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="power-of-two"):
+        sparse(quant={"method": method}).forward_npu(q, q, q, video_metadata())
+    runtime.sparse_attention.assert_not_called()
+    sparse(quant={"method": method, "fallback": ["float"]}).forward_npu(q, q, q, video_metadata())
+    assert runtime.sparse_attention.call_args.kwargs["precision"] == "bf16"
+    runtime.quant_attention_forward.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["fp8", "mxfp4"])
+def test_bsa_batch_above_one_requires_explicit_float_fallback(runtime, monkeypatch, method):
+    runtime.sparse_attention = Mock(side_effect=lambda q, k, v, **kwargs: q)
+    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
+    q = torch.randn(2, 4096, 2, 64, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="batch size 1"):
+        sparse(quant={"method": method}).forward_npu(q, q, q, video_metadata())
+    runtime.sparse_attention.assert_not_called()
+    sparse(quant={"method": method, "fallback": ["float"]}).forward_npu(q, q, q, video_metadata())
+    assert runtime.sparse_attention.call_args.kwargs["precision"] == "bf16"
+    runtime.quant_attention_forward.assert_not_called()

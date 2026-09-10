@@ -74,6 +74,31 @@ def _mindiesd_supports_precision() -> bool:
         return False
 
 
+def _bsa_unsupported_reason(method: str, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> str | None:
+    """Check the BSA contract independently of Dense FIA's geometry limits."""
+    try:
+        from mindiesd import get_bsa_supported_precisions
+    except ImportError:
+        return "MindIE-SD must expose get_bsa_supported_precisions for quantized BSA"
+    if method not in get_bsa_supported_precisions():
+        return f"native BSA does not support {method}"
+    tensors = (query, key, value)
+    if any(t.ndim != 4 or t.dtype not in (torch.float16, torch.bfloat16) for t in tensors):
+        return "quantized BSA requires four-dimensional BF16/FP16 tensors"
+    if key.shape != query.shape or value.shape != query.shape or any(dim == 0 for dim in query.shape):
+        return "quantized BSA requires nonempty identical BSND Q/K/V shapes"
+    if any(t.dtype != query.dtype or t.device != query.device for t in tensors):
+        return "Q/K/V devices and dtypes must match"
+    # RFv3 FP8 squeezes the batch before block quantization. Keep the Wan
+    # quantized BSA integration at batch one until larger batches are qualified.
+    if query.shape[0] != 1:
+        return "quantized Wan BSA requires batch size 1"
+    dim = query.shape[-1]
+    if dim < 64 or dim & (dim - 1):
+        return "BSA Hadamard rotations require a power-of-two head dimension of at least 64"
+    return None
+
+
 def _try_extract_layer_index(prefix: str) -> int | None:
     if not prefix:
         return None
@@ -509,7 +534,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             elif plan.video_spans is not None:
                 reason = "quantized multi-video RainFusion is not supported"
             elif method in ("fp8", "mxfp4"):
-                reason = self.dense_fallback._quant_unsupported_reason(method, query, key, value, None)
+                reason = _bsa_unsupported_reason(method, query, key, value)
             if reason is None and extra.get("rotation_seed", self.quant.get("rotation_seed")) is not None:
                 if "rotation_seed" not in inspect.signature(sparse_attention).parameters:
                     reason = "this MindIE-SD sparse_attention does not support a custom rotation_seed"

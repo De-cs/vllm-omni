@@ -282,6 +282,9 @@ class Attention(nn.Module):
                 parse_kv_cache_skip_selector(quant.skip_layers) or set()
             )
 
+        if self._kv_cache_skip_layers and self.layer_idx is None and not self._disable_kv_quant:
+            raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
+
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps
         skip_layers = self._kv_cache_skip_layers

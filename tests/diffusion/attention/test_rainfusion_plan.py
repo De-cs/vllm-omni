@@ -308,15 +308,12 @@ def test_precision_non_bf16_requires_mindiesd_support():
     import sys
 
     impl = make_impl(precision="mix")
-    sys.modules["mindiesd"] = _fake_mindiesd_module()
-    try:
+    with mock.patch.dict(sys.modules, {"mindiesd": _fake_mindiesd_module()}):
         with mock.patch.object(rainfusion_attn, "_mindiesd_supports_precision", return_value=False):
             with pytest.raises(ValueError, match="explicitly support precision"):
                 impl._forward_sparse_npu(
                     None, None, None, RainFusionPlan(prefix_len=0, used_len=8, latent_shape=[2, 2, 2])
                 )
-    finally:
-        sys.modules.pop("mindiesd", None)
 
 
 def test_precision_non_bf16_passes_gate_when_supported():
@@ -324,8 +321,7 @@ def test_precision_non_bf16_passes_gate_when_supported():
     import sys
 
     impl = make_impl(precision="mix")
-    sys.modules["mindiesd"] = _fake_mindiesd_module()
-    try:
+    with mock.patch.dict(sys.modules, {"mindiesd": _fake_mindiesd_module()}):
         with mock.patch.object(rainfusion_attn, "_mindiesd_supports_precision", return_value=True):
             # q/k/v shapes: [B, S, N, D]; plan geometry must match S.
             q = torch.randn(1, 8, 4, 128)
@@ -333,5 +329,3 @@ def test_precision_non_bf16_passes_gate_when_supported():
             # The gate must pass; the fake mindiesd returns None so no crash.
             out = impl._forward_sparse_npu(q, q, q, plan)
             assert out is None
-    finally:
-        sys.modules.pop("mindiesd", None)

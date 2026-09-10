@@ -517,8 +517,10 @@ class FlashAttentionImpl(AttentionImpl):
             return "quantized FA requires four-dimensional BF16/FP16 tensors"
         if key.shape != value.shape or query.shape[0] != key.shape[0] or query.shape[-1] != key.shape[-1]:
             return "incompatible Q/K/V geometry"
-        if query.dtype != key.dtype or query.dtype != value.dtype:
-            return "Q/K/V dtypes must match"
+        if any(t.device != query.device or t.dtype != query.dtype for t in (key, value)):
+            return "Q/K/V devices and dtypes must match"
+        if any(dim == 0 for t in (query, key, value) for dim in t.shape):
+            return "empty sequences or tensor dimensions are not supported"
         seq_axis, head_axis = (1, 2) if layout == "BSND" else (2, 1)
         if key.shape[head_axis] == 0 or query.shape[head_axis] % key.shape[head_axis]:
             return "Q head count must be a positive multiple of K/V head count"
