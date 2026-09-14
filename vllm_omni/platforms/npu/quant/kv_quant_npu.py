@@ -31,9 +31,7 @@ def get_quant_attention_rotation(
     signs = signs.to(dtype=torch.float32).mul_(2).sub_(1)
     hadamard = torch.ones(1, 1)
     while hadamard.shape[0] < head_dim:
-        hadamard = torch.cat(
-            (torch.cat((hadamard, hadamard), dim=1), torch.cat((hadamard, -hadamard), dim=1)), dim=0
-        )
+        hadamard = torch.cat((torch.cat((hadamard, hadamard), dim=1), torch.cat((hadamard, -hadamard), dim=1)), dim=0)
     rotation = signs[:, None] * hadamard / math.sqrt(head_dim)
     return rotation.to(device=device, dtype=dtype).contiguous()
 
@@ -48,11 +46,17 @@ def fp8_rotate_quant_fa(
 ) -> torch.Tensor:
     """Preserve the legacy layout/scale API and Omni rotation seed."""
     try:
-        from mindiesd import quant_attention_forward
+        from mindiesd import quant_attention
     except ImportError as exc:
-        raise ImportError("NPU FP8 attention requires MindIE-SD quant_attention_forward.") from exc
+        raise ImportError("NPU FP8 attention requires MindIE-SD quant_attention.") from exc
     rotation = get_quant_attention_rotation(query.device, query.dtype, query.shape[-1])
-    return quant_attention_forward(
-        query, key, value, precision="fp8", layout=layout, scale=softmax_scale,
-        q_rot=rotation, k_rot=rotation,
+    return quant_attention(
+        query,
+        key,
+        value,
+        precision="fp8",
+        layout=layout,
+        scale=softmax_scale,
+        q_rot=rotation,
+        k_rot=rotation,
     )

@@ -498,9 +498,9 @@ class FlashAttentionImpl(AttentionImpl):
     def _load_quant_runtime(method):
         if method not in ("fp8", "mxfp8", "mxfp4"):
             raise ValueError(f"Unsupported NPU attention quantization method {method!r}.")
-        from mindiesd import quant_attention_forward
+        from mindiesd import quant_attention
 
-        return quant_attention_forward
+        return quant_attention
 
     def _quant_unsupported_reason(self, method, query, key, value, attn_metadata):
         layout = self.qkv_layout
@@ -531,8 +531,6 @@ class FlashAttentionImpl(AttentionImpl):
             return "generated Hadamard rotations require a power-of-two head dimension"
         if method == "fp8" and query.shape[0] != 1:
             return "block-FP8 Runtime requires batch size 1"
-        if method == "mxfp8" and query.shape != key.shape:
-            return "MXFP8 quant_attention_forward requires equal Q/K/V shapes"
         mask = attn_metadata.attn_mask if attn_metadata else None
         if mask is not None:
             # The minimal public quantized API has no qualified caller-mask path.

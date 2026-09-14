@@ -155,14 +155,15 @@ Wan cross-attention retains its model-level quantization opt-out.
 Models must declare `BSND` or `BNSD`; the adapter passes tensors without an
 unconditional transpose. Quantized calls require BF16/FP16 four-dimensional
 Q/K/V. The current block-FP8 Runtime requires batch size 1;
-MXFP8 requires equal Q/K/V shapes (including sequence lengths and head counts).
+MXFP8 permits different Q/KV sequence lengths and head counts, provided Q heads
+are divisible by KV heads. K/V shapes, batch sizes and head dimensions must match.
 FP8/MXFP8 generated rotations require a power-of-two head dimension. Packed,
 varlen and piecewise calls are outside the quantized contract. Float fallback also
 requires a supported packed path or an explicit mask preserving visibility.
 Caller masks require an explicitly configured `float` fallback; their True=keep
 semantics are preserved. Ring SP is unsupported; validate Ulysses including padding.
 
-The required MindIE build exports `mindiesd.quant_attention_forward`, called with
+The required MindIE build exports `mindiesd.quant_attention`, called with
 `precision=fp8/mxfp8/mxfp4`, the input `layout`, and `scale`.
 Omni supplies cached Q/K rotation matrices for dense FP8/MXFP8 using rotation
 seed `425500`, overridable by `quant.rotation_seed`. This is independent of the

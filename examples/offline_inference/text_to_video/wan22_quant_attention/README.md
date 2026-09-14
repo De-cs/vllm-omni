@@ -2,7 +2,10 @@
 
 These four deployment configurations select Dense MXFP8/MXFP4 or BSA FP8/MXFP4.
 They require Ascend NPU, a matching TorchNPU/CANN stack and the MindIE-SD build
-that exports `quant_attention_forward` and `get_bsa_supported_precisions`.
+that exports `quant_attention` and `get_bsa_supported_precisions`.
+The Dense API must include both MXFP8 and MXFP4 implementations; the FP8-only
+entry point is insufficient. The BSA capability query remains a required
+dependency of these configurations, including its matching native support.
 
 Run from the repository root, replacing the model path and configuration name:
 

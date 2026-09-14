@@ -18,9 +18,7 @@ from vllm_omni.diffusion.attention.backends import flash_attn, rainfusion_attn
 from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
 
 mindiesd = pytest.importorskip("mindiesd")
-if not hasattr(mindiesd, "quant_attention_forward"):
-    pytest.skip("MindIE-SD public quantized attention API is required", allow_module_level=True)
-qfa = importlib.import_module("mindiesd.layers.flash_attn.quant_attention_forward")
+torch_npu = importlib.import_module("torch_npu")
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -28,6 +26,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 @pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
 @pytest.mark.parametrize("layout", ["BSND", "BNSD"])
 def test_omni_calls_real_dense_public_api(monkeypatch, precision, layout):
+    assert callable(getattr(mindiesd, "quant_attention", None)), "MindIE-SD must export quant_attention"
     monkeypatch.setattr(flash_attn, "current_omni_platform", SimpleNamespace(is_npu=lambda: True, device_name="npu"))
     monkeypatch.setattr(flash_attn, "get_current_diffusion_config_or_none", lambda: None)
     quantized_inputs = []
@@ -39,14 +38,14 @@ def test_omni_calls_real_dense_public_api(monkeypatch, precision, layout):
         shape[axis] = max(1, shape[axis] // 32)
         return tensor, torch.ones(shape, dtype=torch.uint8)
 
-    monkeypatch.setattr(qfa.torch_npu, "npu_dynamic_block_quant", dynamic_quant, raising=False)
-    monkeypatch.setattr(qfa.torch_npu, "npu_dynamic_mx_quant", dynamic_quant, raising=False)
+    monkeypatch.setattr(torch_npu, "npu_dynamic_block_quant", dynamic_quant, raising=False)
+    monkeypatch.setattr(torch_npu, "npu_dynamic_mx_quant", dynamic_quant, raising=False)
     execute = Mock(side_effect=lambda query, *args, **kwargs: (query, None))
     metadata = Mock(return_value=torch.zeros(1, dtype=torch.int32))
     if precision == "fp8":
         monkeypatch.setattr(torch.ops.mindiesd, "fused_infer_attention_score_v2", execute, raising=False)
     elif precision == "mxfp8":
-        monkeypatch.setattr(qfa.torch_npu, "npu_fused_infer_attention_score_v2", execute, raising=False)
+        monkeypatch.setattr(torch_npu, "npu_fused_infer_attention_score_v2", execute, raising=False)
     else:
         monkeypatch.setattr(torch.ops.mindiesd, "quant_flash_attn", execute, raising=False)
         monkeypatch.setattr(torch.ops.mindiesd, "quant_flash_attn_metadata", metadata, raising=False)
@@ -55,7 +54,10 @@ def test_omni_calls_real_dense_public_api(monkeypatch, precision, layout):
     if layout == "BNSD":
         query = query.transpose(1, 2)
     impl = flash_attn.FlashAttentionImpl(
-        num_heads=2, head_size=64, softmax_scale=0.37, qkv_layout=layout,
+        num_heads=2,
+        head_size=64,
+        softmax_scale=0.37,
+        qkv_layout=layout,
         backend_kwargs={"quant": {"method": precision, "fallback": []}},
     )
     output = impl.forward_fa_quant_npu(query, query, query)
@@ -81,11 +83,49 @@ def test_omni_calls_real_dense_public_api(monkeypatch, precision, layout):
         assert quantized_inputs[0][0].shape[seq_axis] == 512
         assert kwargs["seqused_q"].tolist() == kwargs["seqused_kv"].tolist() == [130]
         assert kwargs["layout_q"] == kwargs["layout_out"] == layout
-        assert kwargs["q_dtype"] == qfa.torch_npu.float4_e2m1fn_x2
-        assert kwargs["q_descale_dtype"] == qfa.torch_npu.float8_e8m0fnu
+        assert kwargs["q_dtype"] == torch_npu.float4_e2m1fn_x2
+        assert kwargs["q_descale_dtype"] == torch_npu.float8_e8m0fnu
+        assert execute.call_args.args[3].shape[:2] == (1, 2)
         assert [entry[1]["axis"] for entry in quantized_inputs] == [-1, -1, seq_axis]
         assert kwargs["metadata"] is metadata.return_value
         metadata.assert_called_once()
+
+
+@pytest.mark.parametrize("layout", ["BSND", "BNSD"])
+@pytest.mark.parametrize("q_len,kv_len", [(17, 8), (8, 17)])
+def test_omni_mxfp8_preserves_separate_lengths_and_heads(monkeypatch, layout, q_len, kv_len):
+    monkeypatch.setattr(flash_attn, "current_omni_platform", SimpleNamespace(is_npu=lambda: True, device_name="npu"))
+    monkeypatch.setattr(flash_attn, "get_current_diffusion_config_or_none", lambda: None)
+
+    def quantize(tensor, **kwargs):
+        return tensor, torch.ones_like(tensor, dtype=torch.uint8)
+
+    monkeypatch.setattr(torch_npu, "npu_dynamic_mx_quant", quantize, raising=False)
+    execute = Mock(side_effect=lambda q, k, v, **kwargs: (q, None))
+    monkeypatch.setattr(torch_npu, "npu_fused_infer_attention_score_v2", execute, raising=False)
+    q = torch.randn(2, q_len, 4, 64, dtype=torch.bfloat16)
+    k = torch.randn(2, kv_len, 2, 64, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    if layout == "BNSD":
+        q, k, v = (tensor.transpose(1, 2) for tensor in (q, k, v))
+    impl = flash_attn.FlashAttentionImpl(
+        num_heads=4,
+        head_size=64,
+        softmax_scale=0.37,
+        qkv_layout=layout,
+        backend_kwargs={"quant": {"method": "mxfp8", "fallback": []}},
+    )
+    output = impl.forward_fa_quant_npu(q, k, v)
+    rotation = get_quant_attention_rotation(q.device, q.dtype, 64, 425500)
+    torch.testing.assert_close(output, q @ rotation)
+    execute.assert_called_once()
+    args, kwargs = execute.call_args
+    assert args[0].shape == (2 * q_len, 4, 64)
+    assert args[1].shape == args[2].shape == (2 * kv_len, 2, 64)
+    assert kwargs["input_layout"] == "TND"
+    assert kwargs["num_query_heads"] == 4 and kwargs["num_key_value_heads"] == 2
+    assert kwargs["actual_seq_qlen"] == [q_len, 2 * q_len]
+    assert kwargs["actual_seq_kvlen"] == [kv_len, 2 * kv_len]
 
 
 @pytest.mark.parametrize("precision", ["fp8", "mxfp4"])
@@ -107,17 +147,28 @@ def test_omni_calls_real_sparse_public_api(monkeypatch, precision, length):
         shape[axis] = max(1, shape[axis] // 32)
         return tensor, torch.ones(shape, dtype=torch.uint8)
 
-    monkeypatch.setattr(qfa.torch_npu, "npu_dynamic_mx_quant", quantize, raising=False)
-    monkeypatch.setattr(qfa.torch_npu, "npu_dynamic_block_quant", quantize, raising=False)
+    monkeypatch.setattr(torch_npu, "npu_dynamic_mx_quant", quantize, raising=False)
+    monkeypatch.setattr(torch_npu, "npu_dynamic_block_quant", quantize, raising=False)
     execute = Mock(side_effect=lambda **kw: (torch.ones_like(kw["query"]), None))
-    names = ("quant_mode", "dst_type_max", "q_dtype", "k_dtype", "v_dtype",
-             "q_scale_dtype", "k_scale_dtype", "v_scale_dtype")
+    names = (
+        "quant_mode",
+        "dst_type_max",
+        "q_dtype",
+        "k_dtype",
+        "v_dtype",
+        "q_scale_dtype",
+        "k_scale_dtype",
+        "v_scale_dtype",
+    )
     execute.default = SimpleNamespace(_schema=SimpleNamespace(arguments=[SimpleNamespace(name=n) for n in names]))
     monkeypatch.setattr(torch.ops.mindiesd, "block_sparse_attention", execute, raising=False)
     monkeypatch.setattr(torch.ops.mindiesd, "block_sparse_attention_version", lambda: 3, raising=False)
     query = torch.randn(1, length, 2, 64, dtype=torch.bfloat16)
     impl = rainfusion_attn.RainFusionAttentionImpl(
-        num_heads=2, head_size=64, softmax_scale=0.37, qkv_layout="BSND",
+        num_heads=2,
+        head_size=64,
+        softmax_scale=0.37,
+        qkv_layout="BSND",
         backend_kwargs={"sparsity": 0.8, "quant": {"method": precision, "fallback": []}},
     )
     plan = rainfusion_attn.RainFusionPlan(used_len=length, prefix_len=0, latent_shape=(1, 1, length))
@@ -134,5 +185,5 @@ def test_omni_calls_real_sparse_public_api(monkeypatch, precision, length):
     if precision == "mxfp4":
         assert kwargs["query"].shape[2] == (length + 63) // 64 * 64
         assert kwargs["quant_mode"] == 2
-        assert kwargs["q_dtype"] == qfa.torch_npu.float4_e2m1fn_x2
-        assert kwargs["v_scale_dtype"] == qfa.torch_npu.float8_e8m0fnu
+        assert kwargs["q_dtype"] == torch_npu.float4_e2m1fn_x2
+        assert kwargs["v_scale_dtype"] == torch_npu.float8_e8m0fnu

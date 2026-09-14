@@ -72,7 +72,7 @@ def test_compatibility_wrapper_delegates(monkeypatch, layout, shape):
 
     runtime = Mock(side_effect=lambda q, k, v, **kwargs: q)
     module = ModuleType("mindiesd")
-    module.quant_attention_forward = runtime
+    module.quant_attention = runtime
     monkeypatch.setitem(sys.modules, module.__name__, module)
     q = torch.randn(shape, dtype=torch.bfloat16)
     assert kv_quant_npu.fp8_rotate_quant_fa(q, q, q, layout=layout, softmax_scale=0.25) is q

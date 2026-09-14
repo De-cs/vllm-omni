@@ -2,19 +2,21 @@
 
 ## 1. 本次交付与验证边界
 
-两仓分支均为 `codex/quant-attention-cleanup`：
+Omni 使用 `codex/quant-attention-cleanup`。本次适配后的 MindIE 依赖是：
 
-| 仓库 | 地址 | 功能提交 |
+| 组件 | 代码来源 | 必须具备的内容 |
 |---|---|---|
-| MindIE-SD | https://gitcode.com/zqxu/MindIE-SD.git | `f5be942` |
-| vLLM-Omni | https://github.com/De-cs/vllm-omni.git | `a2d859f1` |
+| MindIE 公共入口 | 官方 PR605，dev `76f8761` | 导出 `quant_attention`；仅该提交还不包含 Dense MXFP8/MXFP4 |
+| MindIE Dense MXFP8 | PR629，`a1c4185` | MXFP8 实现及独立 Q/KV 长度和头数处理 |
+| MindIE Dense MXFP4 | PR630，`6e24f41` | MXFP4 实现；与 MXFP8 放在同一套验证包中 |
+| MindIE BSA 查询 | 配套开发实现 | 导出 `get_bsa_supported_precisions`，并具备与之匹配的 native 查询支持 |
+| Omni | https://github.com/De-cs/vllm-omni.git | 本分支的正式 `quant_attention` 接口适配代码 |
 
-Omni 分支在功能提交之后包含本操作报告。没有提交上游 PR。
-本次讨论的“将旋转校验提前到 RFv3 入口”只是建议，尚未修改；当前仍在旋转 helper 中校验。
+此处保留 BSA 查询方法的依赖，预设配套 MindIE 提供该方法；不能用只有官方 dev 的包代替。
+两个 MX PR 是独立分支，任选其中一个并不包含另一种 Dense 精度。先准备包含所需改动的集成分支或 wheel，再运行下面的四路径验证。
 
-本地已完成 CPU 接口验证：MindIE 24 passed（另有 23 subtests），Omni 联合测试 97 passed、10 skipped。使用了绕开本地缺失 NPU/vLLM 初始化的测试引导脚本；这些数字不代表下述原生环境命令已执行。两仓串联测试调用真实公开 Python 函数，底层 NPU 算子使用替身。已检查修改的 Python 代码 Ruff 和 diff whitespace。
-
-尚未完成：真实 NPU 算子执行、C++ 编译、图模式、视频质量、VBench、性能收益。以下是待执行步骤，不是验收通过报告。
+CPU 接口测试与真实 NPU 验证分别记录；旧开发分支的测试数量和视频冒烟不能替代当前代码组合的验证。
+以下是环境验证步骤，不是当前组合已通过 NPU、图模式、质量或性能验收的声明。
 
 ## 2. 获取代码与安装
 
@@ -27,7 +29,9 @@ set -euo pipefail
 export VALIDATION_ROOT="$PWD/wan22-quant-validation"
 mkdir -p "$VALIDATION_ROOT"
 cd "$VALIDATION_ROOT"
-git clone --branch codex/quant-attention-cleanup https://gitcode.com/zqxu/MindIE-SD.git mindiesd-src
+# 先把变量设为已准备好的 MindIE 集成分支：同时包含上表两个 MX 实现和 BSA 查询。
+: "${MINDIESD_VALIDATION_REF:?请先指定符合上表依赖的 MindIE 集成分支}"
+git clone --branch "$MINDIESD_VALIDATION_REF" https://gitcode.com/zqxu/MindIE-SD.git mindiesd-src
 git clone --branch codex/quant-attention-cleanup https://github.com/De-cs/vllm-omni.git omni-src
 git -C mindiesd-src rev-parse HEAD
 git -C omni-src rev-parse HEAD
@@ -38,7 +42,7 @@ python -m pip freeze > results/pip-freeze-before.txt
 
 私仓认证使用环境已有的 Git 凭据，不将 token 写进命令或日志。重复执行时不要重新 clone，进入已有目录后 fetch 并使用 `git pull --ff-only`，先保留未提交修改。
 
-MindIE 必须重编：本次增加了原生 `block_sparse_attention_version` 查询，只替换 Python 文件不够。下面路径按实际 CANN 安装位置调整：
+从源码构建 MindIE 时，native 必须与 Python 代码配套：当前 BSA 查询实现依赖 `block_sparse_attention_version`，只替换 Python 文件不能给旧插件增加该算子。已有合格配套 wheel 时可直接安装，无需重复构建。Dense MXFP4 的 native 版本也需单独验证；两个 MX Python PR 不包含此前开发分支的 native 修复。下面路径按实际 CANN 安装位置调整：
 
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -73,7 +77,9 @@ print('mindiesd:', mindiesd.__file__)
 print('omni:', vllm_omni.__file__)
 print('npu available:', torch.npu.is_available())
 assert torch.npu.is_available()
-assert callable(mindiesd.quant_attention_forward)
+assert callable(mindiesd.quant_attention)
+print('quant_attention:', mindiesd.quant_attention.__module__)
+assert callable(mindiesd.get_bsa_supported_precisions)
 print('BSA native version:', torch.ops.mindiesd.block_sparse_attention_version())
 supported = mindiesd.get_bsa_supported_precisions()
 print('BSA precisions:', supported)
@@ -81,6 +87,9 @@ for name in ('quant_flash_attn', 'quant_flash_attn_metadata'):
     print(name, getattr(torch.ops.mindiesd, name).default._schema)
 assert callable(torch_npu.npu_fused_infer_attention_score_v2)
 assert callable(torch_npu.npu_dynamic_mx_quant)
+import importlib.util
+for name in ('quant_attention_mxfp8', 'quant_attention_mxfp4'):
+    assert importlib.util.find_spec(f'mindiesd.layers.flash_attn.{name}') is not None, name
 PY
 ```
 
@@ -101,7 +110,7 @@ python -m pytest \
   -q -ra -o addopts='' 2>&1 | tee "$VALIDATION_ROOT/results/contracts.log"
 ```
 
-重点检查：两个 expert 的全局 step 连续；各 expert 内 layer 索引；layer/step 单独与同时命中；cross 不量化；请求间状态隔离；BSA 能力不足按配置回退；算子执行异常直接传播、不重试。`test_mindie_public_integration.py` 还覆盖 Dense 非整块长度和 BSA 65/600 长度，但依然使用算子替身。
+重点检查：两个 expert 的全局 step 连续；各 expert 内 layer 索引；layer/step 单独与同时命中；cross 不量化；请求间状态隔离；BSA 能力不足按配置回退；算子执行异常直接传播、不重试。`test_mindie_public_integration.py` 还覆盖 Dense 非整块长度、MXFP8 不等长 Q/KV 与合法不同头数、BSA 65/600 长度，但依然使用算子替身。已安装的 MindIE 缺少正式入口时测试必须失败，不能因旧入口已删除而跳过整个模块。
 
 ## 5. 四条路径真实模型运行
 
