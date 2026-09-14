@@ -87,13 +87,10 @@ for name in ('quant_flash_attn', 'quant_flash_attn_metadata'):
     print(name, getattr(torch.ops.mindiesd, name).default._schema)
 assert callable(torch_npu.npu_fused_infer_attention_score_v2)
 assert callable(torch_npu.npu_dynamic_mx_quant)
-import importlib.util
-for name in ('quant_attention_mxfp8', 'quant_attention_mxfp4'):
-    assert importlib.util.find_spec(f'mindiesd.layers.flash_attn.{name}') is not None, name
 PY
 ```
 
-完整 BSA 两路径验证要求结果包含 `fp8` 和 `mxfp4`。只有 `bf16, fp8` 时不能声称 MXFP4 可用；空元组表示没有确认到能力，先排查插件加载和 native 库。该查询只检查 native 版本与 schema，不运行 tensor kernel，也不是硬件数值验证。Dense 接口存在同样不等于执行成功。
+完整 BSA 两路径验证要求结果包含 `fp8` 和 `mxfp4`。只有 `bf16, fp8` 时不能声称 MXFP4 可用；空元组表示没有确认到能力，先排查插件加载和 native 库。该查询只检查 native 版本与 schema，不运行 tensor kernel，也不是硬件数值验证。Dense 接口存在同样不等于执行成功；各精度的支持情况通过第 4 节的公开入口串联测试验证，不依赖内部实现文件名。
 
 ## 4. 先跑接口和回退测试
 
