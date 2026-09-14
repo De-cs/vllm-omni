@@ -151,6 +151,9 @@ def test_omni_calls_real_sparse_public_api(monkeypatch, precision, length):
     monkeypatch.setattr(torch_npu, "npu_dynamic_block_quant", quantize, raising=False)
     execute = Mock(side_effect=lambda **kw: (torch.ones_like(kw["query"]), None))
     names = (
+        "q_dequant_scale",
+        "k_dequant_scale",
+        "v_dequant_scale",
         "quant_mode",
         "dst_type_max",
         "q_dtype",
