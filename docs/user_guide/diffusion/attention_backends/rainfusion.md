@@ -78,3 +78,21 @@ Protected video tails require a compatible MindIE-SD release.
 For common configuration and selector behavior, see the
 [attention backend overview](../attention_backends.md) and the
 [backend selection design](../../../design/feature/attention_backend_selection.md).
+
+## Wan2.2 T2V quantization on Ascend
+
+`RAINFUSION_ATTN` accepts `quant.method: fp8` or `mxfp4` for Wan2.2 T2V A14B.
+MindIE-SD must expose `sparse_attention` with `rf_v3` and the read-only
+`get_bsa_supported_precisions` query. Missing capabilities trigger the configured
+`quant.fallback` or an error; native execution errors are never retried.
+BSA retains MindIE's default rotation. An explicit `rotation_seed` requires
+support from the installed sparse API and otherwise follows the same fallback rule.
+
+`quant.skip_layers`/`skip_steps`, or a `float` precision fallback, keep attention
+sparse. The existing `block_sparse` warmup/layer exclusions and short-sequence
+threshold instead select Dense attention, using the configured Dense precision.
+The two kinds of fallback are independent; avoid conflicting non-default
+`block_sparse.precision` and `quant.method` settings.
+
+Minimal configurations: `wan22_quant_attention/bsa_fp8.yaml` and `bsa_mxfp4.yaml`
+under `examples/offline_inference/text_to_video/`.

@@ -11,6 +11,8 @@ stages:
           quant:
             method: mxfp4
             fallback: []
+            skip_layers: "0,39"
+            skip_steps: "0,49"
         cross:
           backend: FLASH_ATTN
           quant:

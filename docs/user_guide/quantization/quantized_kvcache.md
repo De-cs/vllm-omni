@@ -141,3 +141,11 @@ Conflicting per-role and global quantization settings are rejected.
 Minimal T2V deploy configurations are provided in
 `examples/offline_inference/text_to_video/wan22_quant_attention/fa_mxfp8.yaml`
 and `fa_mxfp4.yaml`.
+
+`quant.skip_layers` and `quant.skip_steps` accept index lists or inclusive ranges
+such as `"0,3-5"`; they are combined with the existing global skip selectors.
+Step indices start at zero for the entire denoising request and do not reset when
+Wan switches transformers. Layer indices start at zero within each transformer;
+the same selector applies to both. An unparseable layer index is an error when
+layer skips are configured. A skipped forward uses floating-point attention before
+considering `quant.fallback`: floating Dense for FA, floating sparse for BSA.

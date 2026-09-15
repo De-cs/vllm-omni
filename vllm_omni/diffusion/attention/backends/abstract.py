@@ -214,6 +214,9 @@ class AttentionMetadata:
     #   "quant_fallback": ordered alternative Q/K/V methods; no operator-error retries.
     #   "disable_attention_quant": bool — per-forward skip/model opt-out,
     #     independent of sparse-vs-dense selection.
+    #   "attn_mask_is_padding": bool -- model guarantees the 2D keep mask only
+    #     excludes alignment padding after video_layout.used_len. Sparse backends
+    #     may trim gathered tensors to that length instead of consuming the mask.
     #   "rotation_seed": int — explicit seed for Runtime paths supporting rotation.
     #   "cu_seqlens_q" / "cu_seqlens_k": int32 CUDA tensors describing packed
     #     variable-length query/key sequences for FlashAttention.
