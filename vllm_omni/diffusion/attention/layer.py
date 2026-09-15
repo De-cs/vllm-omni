@@ -289,6 +289,8 @@ class Attention(nn.Module):
         return self.parallel_strategy
 
     def _init_kv_cache_quantization(self, config, spec=None) -> None:
+        from vllm_omni.diffusion.data import parse_kv_cache_skip_selector
+
         self._quant_fallback = ()
         self._rotation_seed = None
         if config is None or self._has_custom_attention:
@@ -324,13 +326,23 @@ class Attention(nn.Module):
         self._kv_cache_dtype = dtype
         self._kv_cache_skip_steps = getattr(config, "diffusion_kv_cache_skip_step_indices", None)
         self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
+        if quant is not None and quant.method is not None:
+            self._kv_cache_skip_steps = (self._kv_cache_skip_steps or set()) | (
+                parse_kv_cache_skip_selector(quant.skip_steps) or set()
+            )
+            self._kv_cache_skip_layers = (self._kv_cache_skip_layers or set()) | (
+                parse_kv_cache_skip_selector(quant.skip_layers) or set()
+            )
+
+        if self._kv_cache_skip_layers and self.layer_idx is None and not self._disable_kv_quant:
+            raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
 
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps
         skip_layers = self._kv_cache_skip_layers
         if skip_steps is not None:
             step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
-            if step_idx is not None and step_idx in skip_steps:
+            if skip_steps and (step_idx is None or step_idx in skip_steps):
                 return False
         if skip_layers is not None:
             if self.layer_idx is not None and self.layer_idx in skip_layers:

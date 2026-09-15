@@ -7,9 +7,11 @@ stages:
     diffusion_attention_config:
       per_role:
         self:
-          backend: FLASH_ATTN
+          backend: RAINFUSION_ATTN
+          block_sparse:
+            sparsity: 0.8
           quant:
-            method: mxfp8
+            method: fp8
             fallback: []
             skip_layers: "0,39"
             skip_steps: "0,49"
