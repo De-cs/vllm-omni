@@ -4,8 +4,6 @@ stages:
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
-    diffusion_kv_cache_skip_steps: "0,1,38,39"
-    diffusion_kv_cache_skip_layers: "0,39"
     diffusion_attention_config:
       per_role:
         self:
@@ -13,6 +11,8 @@ stages:
           quant:
             method: mxfp4
             fallback: []
+            skip_layers: "0,39"
+            skip_steps: "0,1,38,39"
         cross:
           backend: FLASH_ATTN
           quant:

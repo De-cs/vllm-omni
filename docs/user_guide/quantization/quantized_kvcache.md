@@ -143,12 +143,17 @@ Minimal T2V deploy configurations are provided in
 and `fa_mxfp4.yaml`.
 
 These examples use **40 denoising steps**, with
-`diffusion_kv_cache_skip_steps: "0,1,38,39"` and
-`diffusion_kv_cache_skip_layers: "0,39"`. Selected forwards use floating-point
+`quant.skip_steps: "0,1,38,39"` and `quant.skip_layers: "0,39"`. Selected forwards use floating-point
 Dense attention before considering `quant.fallback`. Steps are zero-based across
 the complete request and do not reset when Wan switches transformers; layer
 indices are local to each transformer. These are fixed indices, not a relative
 "last two steps" selector. Adjust them if the inference step count changes.
+
+`quant.skip_layers` and `quant.skip_steps` accept index lists or inclusive ranges
+such as `"0,3-5"`; they are combined with the existing global skip selectors.
+An unparsable layer index is an error when layer skips are configured.
+A skipped forward uses floating-point attention before considering
+`quant.fallback`: floating Dense for FA, floating sparse for BSA.
 
 ### Pinned dependencies
 

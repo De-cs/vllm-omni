@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_omni.diffusion.attention.backends import flash_attn
+from vllm_omni.diffusion.attention.backends import flash_attn, rainfusion_attn
 from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
 
 mindiesd = pytest.importorskip("mindiesd")
@@ -105,3 +105,67 @@ def test_omni_calls_real_dense_public_api(monkeypatch, precision, layout, batch,
         assert [entry[1]["axis"] for entry in quantized_inputs] == [-1, -1, seq_axis]
         assert kwargs["metadata"] is metadata.return_value
         metadata.assert_called_once()
+
+
+@pytest.mark.parametrize("precision", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("length", [65, 600])
+def test_omni_calls_real_sparse_public_api(monkeypatch, precision, length):
+    rf = importlib.import_module("mindiesd.layers.flash_attn.sparse_flash_attn_rf_v3")
+    monkeypatch.setattr(flash_attn, "current_omni_platform", SimpleNamespace(is_npu=lambda: True, device_name="npu"))
+    for module in (flash_attn, rainfusion_attn):
+        monkeypatch.setattr(module, "get_current_diffusion_config_or_none", lambda: None)
+    rainfusion_attn._mindiesd_supports_precision.cache_clear()
+    monkeypatch.setattr(rf, "do_tensor_rearrange_only", lambda q, k, v, *a, **kw: (q, k, v))
+    monkeypatch.setattr(rf, "avgpool", lambda *a, **kw: torch.ones(1))
+    monkeypatch.setattr(rf, "_generate_mask_direct", lambda *a, **kw: torch.ones(1, 2, 8, 8))
+    monkeypatch.setattr(rf, "_bsa_inv_rearrange", lambda out, *a: out)
+
+    def quantize(tensor, **kwargs):
+        shape = list(tensor.shape)
+        axis = kwargs.get("axis", -1)
+        shape[axis] = max(1, shape[axis] // 32)
+        return tensor, torch.ones(shape, dtype=torch.uint8)
+
+    monkeypatch.setattr(torch_npu, "npu_dynamic_mx_quant", quantize, raising=False)
+    monkeypatch.setattr(torch_npu, "npu_dynamic_block_quant", quantize, raising=False)
+    execute = Mock(side_effect=lambda **kw: (torch.ones_like(kw["query"]), None))
+    names = (
+        "q_dequant_scale",
+        "k_dequant_scale",
+        "v_dequant_scale",
+        "quant_mode",
+        "dst_type_max",
+        "q_dtype",
+        "k_dtype",
+        "v_dtype",
+        "q_scale_dtype",
+        "k_scale_dtype",
+        "v_scale_dtype",
+    )
+    execute.default = SimpleNamespace(_schema=SimpleNamespace(arguments=[SimpleNamespace(name=n) for n in names]))
+    monkeypatch.setattr(torch.ops.mindiesd, "block_sparse_attention", execute, raising=False)
+    monkeypatch.setattr(torch.ops.mindiesd, "block_sparse_attention_version", lambda: 3, raising=False)
+    query = torch.randn(1, length, 2, 64, dtype=torch.bfloat16)
+    impl = rainfusion_attn.RainFusionAttentionImpl(
+        num_heads=2,
+        head_size=64,
+        softmax_scale=0.37,
+        qkv_layout="BSND",
+        backend_kwargs={"sparsity": 0.8, "quant": {"method": precision, "fallback": []}},
+    )
+    plan = rainfusion_attn.RainFusionPlan(used_len=length, prefix_len=0, latent_shape=(1, 1, length))
+    try:
+        output = impl._forward_sparse_npu(query, query, query, plan)
+    finally:
+        rainfusion_attn._mindiesd_supports_precision.cache_clear()
+    torch.testing.assert_close(output, torch.ones_like(query))
+    execute.assert_called_once()
+    kwargs = execute.call_args.kwargs
+    assert kwargs["actual_seq_lengths"] == kwargs["actual_seq_lengths_kv"] == [length]
+    assert kwargs["q_input_layout"] == "BNSD"
+    assert kwargs["block_sparse_mask"] is not None
+    if precision == "mxfp4":
+        assert kwargs["query"].shape[2] == (length + 63) // 64 * 64
+        assert kwargs["quant_mode"] == 2
+        assert kwargs["q_dtype"] == torch_npu.float4_e2m1fn_x2
+        assert kwargs["v_scale_dtype"] == torch_npu.float8_e8m0fnu
