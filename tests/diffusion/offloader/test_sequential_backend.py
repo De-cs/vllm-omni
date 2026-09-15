@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for SequentialOffloadBackend."""
 
@@ -37,6 +37,30 @@ def _create_simple_module() -> nn.Module:
             self.linear = nn.Linear(10, 20)
 
     return SimpleModule()
+
+
+@pytest.mark.parametrize("pin_memory", [False, True])
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_cpu_offload_respects_pinned_memory_policy(monkeypatch, pin_memory, non_blocking):
+    module = _create_simple_module()
+    module.register_buffer("state", torch.ones(2))
+    transfers = []
+    pins = []
+    original_to = torch.Tensor.to
+
+    def record_to(tensor, device, **kwargs):
+        transfers.append((device, kwargs["non_blocking"]))
+        return original_to(tensor, device, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", record_to)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: pins.append(tensor) or tensor)
+    # An indexed CPU device exercises both parameter and buffer movement without
+    # hardware; assert the flags at the Tensor.to allocation boundary.
+    target = torch.device("cpu:1")
+    assert SequentialOffloadHook._move_params(module, target, non_blocking=non_blocking, pin_memory=pin_memory)
+    expected_async = pin_memory and non_blocking
+    assert transfers == [(target, expected_async)] * 3
+    assert len(pins) == (3 if pin_memory else 0)
 
 
 def _track_pin_memory_calls():

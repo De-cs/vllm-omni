@@ -85,6 +85,10 @@ class SequentialOffloadHook(ModelHook):
         refer to
         https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
         """
+        # PyTorch non-blocking device-to-host copies allocate pinned storage
+        # even without an explicit pin_memory() call. Honor ordinary CPU memory.
+        if target_device.type == "cpu" and not pin_memory:
+            non_blocking = False
         moved = False
         for p in module.parameters():
             if p.data.device != target_device:
