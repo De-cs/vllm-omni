@@ -97,7 +97,7 @@ def test_omni_calls_real_dense_public_api(monkeypatch, precision, layout, batch,
     else:
         seq_axis = 1 if layout == "BSND" else 2
         assert quantized_inputs[0][0].shape[seq_axis] == 512
-        assert kwargs["seqused_q"].tolist() == kwargs["seqused_kv"].tolist() == [130]
+        assert kwargs["seqused_q"].tolist() == kwargs["seqused_kv"].tolist() == [512]
         assert kwargs["layout_q"] == kwargs["layout_out"] == layout
         assert kwargs["q_dtype"] == torch_npu.float4_e2m1fn_x2
         assert kwargs["q_descale_dtype"] == torch_npu.float8_e8m0fnu
