@@ -308,15 +308,10 @@ class RainFusionAttentionImpl(AttentionImpl):
         if (rf.start_step and step_idx is None) or (rf.end_step and (step_idx is None or total_steps is None)):
             return None
         if step_idx is not None:
-            if step_idx is not None and step_idx < rf.start_step:
+            if step_idx < rf.start_step:
                 return None
             # Tail fallback: keep the last ``end_step`` denoise steps dense.
-            if (
-                rf.end_step > 0
-                and step_idx is not None
-                and total_steps is not None
-                and step_idx >= total_steps - rf.end_step
-            ):
+            if rf.end_step > 0 and total_steps is not None and step_idx >= total_steps - rf.end_step:
                 return None
         if self.qkv_layout is None:
             # The sparse path reads the sequence off dim 1, which the tensors alone
@@ -512,6 +507,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         extra = attn_metadata.extra if attn_metadata else {}
         requested = extra.get("kv_cache_dtype", self.quant.get("method", self.rainfusion.precision))
         fallback = extra.get("quant_fallback", self.quant.get("fallback", ()))
+        rotation_seed = extra.get("rotation_seed", self.quant.get("rotation_seed"))
         if extra.get("disable_attention_quant"):
             requested, fallback = "float", ()
         reasons: list[str] = []
@@ -529,7 +525,7 @@ class RainFusionAttentionImpl(AttentionImpl):
                 reason = "quantized multi-video RainFusion is not supported"
             elif method in ("fp8", "mxfp4"):
                 reason = _bsa_unsupported_reason(query, key, value)
-            if reason is None and extra.get("rotation_seed", self.quant.get("rotation_seed")) is not None:
+            if reason is None and rotation_seed is not None:
                 if "rotation_seed" not in inspect.signature(sparse_attention).parameters:
                     reason = "this MindIE-SD sparse_attention does not support a custom rotation_seed"
             if reason is None:
@@ -555,7 +551,6 @@ class RainFusionAttentionImpl(AttentionImpl):
             "sparsity": self.rainfusion.sparsity,
             "precision": precision,
         }
-        rotation_seed = extra.get("rotation_seed", self.quant.get("rotation_seed"))
         if precision != "bf16" and rotation_seed is not None:
             common_kwargs["rotation_seed"] = rotation_seed
         if plan.video_spans is not None:

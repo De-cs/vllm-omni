@@ -312,28 +312,17 @@ def test_sparse_model_padding_mask_is_equivalent_to_trimming(runtime):
 
 
 @pytest.mark.parametrize("method", ["fp8", "mxfp4"])
-def test_bsa_precheck_is_independent_of_dense_fia(runtime, monkeypatch, method):
+@pytest.mark.parametrize("fallback", [[], ["float"]])
+def test_bsa_uses_requested_precision_without_dense_precheck_or_native_query(runtime, monkeypatch, method, fallback):
     def execute(q, k, v, *, precision="bf16", **kwargs):
         return q
 
     runtime.sparse_attention = Mock(wraps=execute)
     monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
     q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
-    impl = sparse(quant={"method": method})
+    impl = sparse(quant={"method": method, "fallback": fallback})
     impl.dense_fallback._quant_unsupported_reason = Mock(side_effect=AssertionError("dense precheck called"))
     assert impl.forward_npu(q, q, q, video_metadata()) is not None
-    assert runtime.sparse_attention.call_args.kwargs["precision"] == method
-
-
-@pytest.mark.parametrize("method", ["fp8", "mxfp4"])
-def test_bsa_calls_requested_precision_without_native_query(runtime, monkeypatch, method):
-    def execute(q, k, v, *, precision="bf16", **kwargs):
-        return q
-
-    runtime.sparse_attention = Mock(wraps=execute)
-    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
-    q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
-    sparse(quant={"method": method, "fallback": ["float"]}).forward_npu(q, q, q, video_metadata())
     assert runtime.sparse_attention.call_args.kwargs["precision"] == method
     runtime.sparse_attention.assert_called_once()
     runtime.quant_attention.assert_not_called()

@@ -575,7 +575,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if query.shape[head_axis] % key.shape[head_axis]:
             return "Q head count must be a positive multiple of K/V head count"
         dim = query.shape[-1]
-        if method in ("fp8", "mxfp8") and (dim == 0 or dim & (dim - 1)):
+        if method in ("fp8", "mxfp8") and dim & (dim - 1):
             return "generated Hadamard rotations require a power-of-two head dimension"
         if method == "fp8" and query.shape[0] != 1:
             return "block-FP8 Runtime requires batch size 1"
@@ -649,7 +649,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             raise ValueError("NPU float attention requires an explicit mask for unsupported packed/piecewise metadata.")
         if use_sdpa:
             q, k, v = (tensor.transpose(1, 2) if layout == "BSND" else tensor for tensor in (query, key, value))
-            mask = attn_metadata.attn_mask if attn_metadata else None
             if mask is not None:
                 mask = _maybe_reshape_attn_mask(q.transpose(1, 2), k.transpose(1, 2), mask)
             out = torch.nn.functional.scaled_dot_product_attention(
@@ -662,7 +661,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 enable_gqa=q.shape[1] != k.shape[1],
             )
             return out.transpose(1, 2) if layout == "BSND" else out
-        attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        attention_mask = mask
         if self.causal:
             import torch_npu
 

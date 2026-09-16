@@ -166,6 +166,11 @@ release. Build its Python package, PyTorch plugin and custom operators from that
 same revision following its [installation guide](https://gitcode.com/zqxu/MindIE-SD/blob/8637b5333b0225381b215390fd09a8732e671cc4/docs/en/installation.md); copying Python files alone is
 insufficient. MindIE-SD PR 630 supplies the MXFP4 API, not those native fixes.
 
+BSA FP8/MXFP4 additionally require `sparse_attention` with an explicit
+`precision` argument and RFv3 support. Omni passes the precision directly;
+native execution errors propagate without retry. For sparse policy details,
+see [RainFusion attention](../diffusion/attention_backends/rainfusion.md).
+
 Use a supported Ascend device and matching CANN/PyTorch/torch_npu stack. For each
 qualification run, record the Omni and MindIE source commits, wheel SHA256, CANN
 version, device model, `torch`/`torch_npu` versions and loaded native library paths.
@@ -190,16 +195,16 @@ export WAN_MODEL=/path/to/Wan2.2-T2V-A14B-Diffusers
 export OUT_DIR="$PWD/wan22-attention-validation"
 mkdir -p "$OUT_DIR"
 set -o pipefail
-for precision in mxfp8 mxfp4; do
+for config in fa_mxfp8 fa_mxfp4 bsa_fp8 bsa_mxfp4; do
     python -u examples/offline_inference/text_to_video/text_to_video.py \
         --model "$WAN_MODEL" \
-        --deploy-config "examples/offline_inference/text_to_video/wan22_quant_attention/fa_${precision}.yaml" \
+        --deploy-config "examples/offline_inference/text_to_video/wan22_quant_attention/${config}.yaml" \
         --num-inference-steps 40 --num-frames 17 --height 384 --width 640 \
         --prompt "A cat walking through a sunlit garden" --seed 42 \
         --enable-cpu-offload --vae-use-tiling --enforce-eager \
-        --output "$OUT_DIR/fa_${precision}.mp4" 2>&1 | tee "$OUT_DIR/fa_${precision}.log"
+        --output "$OUT_DIR/${config}.mp4" 2>&1 | tee "$OUT_DIR/${config}.log"
     result=$?
-    printf 'PROCESS_EXIT_CODE=%s\n' "$result" | tee -a "$OUT_DIR/fa_${precision}.log"
+    printf 'PROCESS_EXIT_CODE=%s\n' "$result" | tee -a "$OUT_DIR/${config}.log"
     if [ "$result" -ne 0 ]; then exit "$result"; fi
 done
 ```
