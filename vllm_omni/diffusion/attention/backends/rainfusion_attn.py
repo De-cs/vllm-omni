@@ -74,14 +74,8 @@ def _mindiesd_supports_precision() -> bool:
         return False
 
 
-def _bsa_unsupported_reason(method: str, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> str | None:
+def _bsa_unsupported_reason(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> str | None:
     """Check the BSA contract independently of Dense FIA's geometry limits."""
-    try:
-        from mindiesd import get_bsa_supported_precisions
-    except ImportError:
-        return "MindIE-SD must expose get_bsa_supported_precisions for quantized BSA"
-    if method not in get_bsa_supported_precisions():
-        return f"native BSA does not support {method}"
     tensors = (query, key, value)
     if any(t.ndim != 4 or t.dtype not in (torch.float16, torch.bfloat16) for t in tensors):
         return "quantized BSA requires four-dimensional BF16/FP16 tensors"
@@ -534,7 +528,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             elif plan.video_spans is not None:
                 reason = "quantized multi-video RainFusion is not supported"
             elif method in ("fp8", "mxfp4"):
-                reason = _bsa_unsupported_reason(method, query, key, value)
+                reason = _bsa_unsupported_reason(query, key, value)
             if reason is None and extra.get("rotation_seed", self.quant.get("rotation_seed")) is not None:
                 if "rotation_seed" not in inspect.signature(sparse_attention).parameters:
                     reason = "this MindIE-SD sparse_attention does not support a custom rotation_seed"

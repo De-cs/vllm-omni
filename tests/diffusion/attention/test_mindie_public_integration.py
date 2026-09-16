@@ -129,22 +129,7 @@ def test_omni_calls_real_sparse_public_api(monkeypatch, precision, length):
     monkeypatch.setattr(torch_npu, "npu_dynamic_mx_quant", quantize, raising=False)
     monkeypatch.setattr(torch_npu, "npu_dynamic_block_quant", quantize, raising=False)
     execute = Mock(side_effect=lambda **kw: (torch.ones_like(kw["query"]), None))
-    names = (
-        "q_dequant_scale",
-        "k_dequant_scale",
-        "v_dequant_scale",
-        "quant_mode",
-        "dst_type_max",
-        "q_dtype",
-        "k_dtype",
-        "v_dtype",
-        "q_scale_dtype",
-        "k_scale_dtype",
-        "v_scale_dtype",
-    )
-    execute.default = SimpleNamespace(_schema=SimpleNamespace(arguments=[SimpleNamespace(name=n) for n in names]))
     monkeypatch.setattr(torch.ops.mindiesd, "block_sparse_attention", execute, raising=False)
-    monkeypatch.setattr(torch.ops.mindiesd, "block_sparse_attention_version", lambda: 3, raising=False)
     query = torch.randn(1, length, 2, 64, dtype=torch.bfloat16)
     impl = rainfusion_attn.RainFusionAttentionImpl(
         num_heads=2,

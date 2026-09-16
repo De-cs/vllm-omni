@@ -82,9 +82,11 @@ For common configuration and selector behavior, see the
 ## Wan2.2 T2V quantization on Ascend
 
 `RAINFUSION_ATTN` accepts `quant.method: fp8` or `mxfp4` for Wan2.2 T2V A14B.
-MindIE-SD must expose `sparse_attention` with `rf_v3` and the read-only
-`get_bsa_supported_precisions` query. Missing capabilities trigger the configured
-`quant.fallback` or an error; native execution errors are never retried.
+MindIE-SD must expose `sparse_attention` with `rf_v3` and an explicit `precision`
+argument. Omni passes the selected precision directly to this API; the installed
+native operators must support that precision. Unsupported inputs or Python API
+compatibility trigger the configured `quant.fallback` or an error. Native
+execution errors propagate without retry.
 BSA retains MindIE's default rotation. An explicit `rotation_seed` requires
 support from the installed sparse API and otherwise follows the same fallback rule.
 

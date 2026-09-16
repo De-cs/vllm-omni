@@ -25,7 +25,6 @@ def runtime(monkeypatch):
         return q
 
     setattr(mod, "quant_attention", Mock(side_effect=execute))
-    setattr(mod, "get_bsa_supported_precisions", lambda: ("bf16", "fp8", "mxfp4"))
     monkeypatch.setitem(sys.modules, mod.__name__, mod)
     for module in (flash_attn, layer_mod):
         monkeypatch.setattr(module, "current_omni_platform", SimpleNamespace(is_npu=lambda: True, device_name="npu"))
@@ -326,29 +325,18 @@ def test_bsa_precheck_is_independent_of_dense_fia(runtime, monkeypatch, method):
     assert runtime.sparse_attention.call_args.kwargs["precision"] == method
 
 
-@pytest.mark.parametrize("available,expected", [(("bf16", "fp8"), "fp8"), (("bf16",), "bf16")])
-def test_bsa_native_capability_selects_configured_chain(runtime, monkeypatch, available, expected):
+@pytest.mark.parametrize("method", ["fp8", "mxfp4"])
+def test_bsa_calls_requested_precision_without_native_query(runtime, monkeypatch, method):
     def execute(q, k, v, *, precision="bf16", **kwargs):
         return q
 
     runtime.sparse_attention = Mock(wraps=execute)
-    runtime.get_bsa_supported_precisions = lambda: available
     monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
     q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
-    sparse(quant={"method": "mxfp4", "fallback": ["fp8", "float"]}).forward_npu(q, q, q, video_metadata())
-    assert runtime.sparse_attention.call_args.kwargs["precision"] == expected
+    sparse(quant={"method": method, "fallback": ["float"]}).forward_npu(q, q, q, video_metadata())
+    assert runtime.sparse_attention.call_args.kwargs["precision"] == method
     runtime.sparse_attention.assert_called_once()
     runtime.quant_attention.assert_not_called()
-
-
-def test_bsa_missing_capability_query_is_not_assumed_supported(runtime, monkeypatch):
-    runtime.sparse_attention = Mock()
-    del runtime.get_bsa_supported_precisions
-    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
-    q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="get_bsa_supported_precisions"):
-        sparse(quant={"method": "fp8"}).forward_npu(q, q, q, video_metadata())
-    runtime.sparse_attention.assert_not_called()
 
 
 def test_bsa_operator_failure_never_retries(runtime, monkeypatch):
