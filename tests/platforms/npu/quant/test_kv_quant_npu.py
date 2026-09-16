@@ -112,20 +112,25 @@ def test_fp8_rotate_quant_fa_real_npu_shape_contract(layout):
 @pytest.mark.npu
 @pytest.mark.parametrize("method", ["fp8", "mxfp8", "mxfp4"])
 @pytest.mark.parametrize("layout", ["BSND", "BNSD"])
-def test_dense_runtime_backend_real_npu(method, layout):
+@pytest.mark.parametrize("seq_len", [256, 75600])
+def test_dense_runtime_backend_real_npu(method, layout, seq_len):
     from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 
     # On NPU, missing Runtime symbols must fail this qualification test.
-    query = torch.randn(1, 256, 2, 64, dtype=torch.bfloat16, device="npu")
+    query = torch.randn(1, seq_len, 2, 128, dtype=torch.bfloat16, device="npu") * 0.1
+    # Distinct constant values per head detect head/layout mixing and tail writes.
+    value = torch.tensor([0.5, -0.5], dtype=query.dtype, device=query.device)
+    value = value.view(1, 1, 2, 1).expand_as(query).contiguous()
     if layout == "BNSD":
-        query = query.transpose(1, 2)
+        query, value = query.transpose(1, 2), value.transpose(1, 2)
     impl = FlashAttentionImpl(
         num_heads=2,
-        head_size=64,
-        softmax_scale=0.125,
+        head_size=128,
+        softmax_scale=128**-0.5,
         qkv_layout=layout,
         backend_kwargs={"quant": {"method": method}},
     )
-    out = impl.forward_npu(query, query, query)
+    out = impl.forward_npu(query, query, value)
     assert out.shape == query.shape and out.dtype == query.dtype
     assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float().cpu(), value.float().cpu(), rtol=0.02, atol=0.02)

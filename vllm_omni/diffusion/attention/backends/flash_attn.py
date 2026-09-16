@@ -553,9 +553,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> str | None:
-        layout = self.qkv_layout
+        layout = self.qkv_layout or "BSND"
         if layout not in ("BSND", "BNSD"):
-            return "quantized FA requires an explicit BSND or BNSD layout"
+            return "quantized FA requires BSND or BNSD layout"
         if self.causal:
             return "causal quantized FA is not supported"
         extra = attn_metadata.extra if attn_metadata else {}
@@ -596,6 +596,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         extra = attn_metadata.extra if attn_metadata else {}
         method = extra.get("kv_cache_dtype", self.quant.get("method", "fp8"))
         fallback = extra.get("quant_fallback", self.quant.get("fallback", ()))
+        layout = self.qkv_layout or "BSND"
         reasons: list[str] = []
         for candidate in (method, *fallback):
             if candidate == "float":
@@ -614,7 +615,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                     ) from exc
                 reasons.append(f"{candidate}: MindIE-SD Runtime unavailable ({exc})")
                 continue
-            kwargs = dict(precision=candidate, layout=self.qkv_layout, scale=self.softmax_scale)
+            kwargs = dict(precision=candidate, layout=layout, scale=self.softmax_scale)
             # The function does not generate rotations. Retain Omni's existing FP8/MXFP8 policy.
             if candidate in ("fp8", "mxfp8"):
                 from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
@@ -624,7 +625,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 kwargs.update(q_rot=rotation, k_rot=rotation)
             if reasons:
                 logger.warning_once("NPU attention falling back to %s: %s", candidate, "; ".join(reasons))
-            logger.info_once("NPU attention uses MindIE-SD %s Runtime, layout=%s.", candidate, self.qkv_layout)
+            logger.info_once("NPU attention uses MindIE-SD %s Runtime, layout=%s.", candidate, layout)
             # Execution errors propagate. Never retry after an operator failure.
             return runtime(query, key, value, **kwargs)
         raise ValueError("No supported NPU attention quantization method: " + "; ".join(reasons))
@@ -636,6 +637,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        layout = self.qkv_layout or "BSND"
         extra = attn_metadata.extra if attn_metadata else {}
         mask = attn_metadata.attn_mask if attn_metadata else None
         packed = any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k"))
@@ -646,7 +648,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         ):
             raise ValueError("NPU float attention requires an explicit mask for unsupported packed/piecewise metadata.")
         if use_sdpa:
-            layout = self.qkv_layout or "BNSD"
             q, k, v = (tensor.transpose(1, 2) if layout == "BSND" else tensor for tensor in (query, key, value))
             mask = attn_metadata.attn_mask if attn_metadata else None
             if mask is not None:
@@ -665,7 +666,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if self.causal:
             import torch_npu
 
-            if self.qkv_layout == "BNSD":
+            if layout == "BNSD":
                 query, key, value = (tensor.transpose(1, 2) for tensor in (query, key, value))
 
             if attention_mask is None:
@@ -710,7 +711,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 inner_precise=inner_precise,
                 sparse_mode=sparse_mode,
             )[0]
-            return out.transpose(1, 2) if self.qkv_layout == "BNSD" else out
+            return out.transpose(1, 2) if layout == "BNSD" else out
 
         from mindiesd import attention_forward
 
@@ -748,7 +749,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         # [B, N, Sq, Skv], [B, 1, Sq, Skv], [1, 1, Sq, Skv], or [Sq, Skv]
         # But the incoming mask is 2D [B, S] — reshape to [B, 1, 1, S]
         # So reuse SDPA's mask reshape logic: [B, S] -> [B, 1, Sq, Skv]
-        layout = self.qkv_layout or "BNSD"
         q_bsnd = query if layout == "BSND" else query.transpose(1, 2)
         k_bsnd = key if layout == "BSND" else key.transpose(1, 2)
         attention_mask = _maybe_reshape_attn_mask(q_bsnd, k_bsnd, attention_mask, mask_mode="full_qk")

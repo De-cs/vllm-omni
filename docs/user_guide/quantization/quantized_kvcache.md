@@ -26,7 +26,7 @@ attention runs in the native dtype.
 ## Hardware Support
 
 | Device | FP8 FA |
-|--------|--------|
+| -------- | -------- |
 | Ascend NPU | ✅ |
 | NVIDIA GPU | ❌ |
 | AMD ROCm | ❌ |
@@ -43,7 +43,7 @@ and reject an incompatible explicit configuration.
 ### Diffusion Model
 
 | Model | Scope | Status | Notes |
-|-------|-------|--------|-------|
+| --- | --- | --- | --- |
 | Wan2.2 | Eligible DiT full-attention FA on Ascend NPU | Tested | Compare quality and latency against a BF16 baseline before production use |
 | Other diffusion models | Eligible DiT full-attention FA on Ascend NPU | Not tested | You can try `diffusion_kv_cache_dtype="fp8"`; tune `diffusion_kv_cache_skip_steps` and `diffusion_kv_cache_skip_layers` when higher precision is needed |
 
@@ -104,7 +104,7 @@ The legacy keyword aliases `kv_cache_dtype`, `kv_cache_skip_steps`, and
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `diffusion_kv_cache_dtype` | str \| None | `None` | Set to `"fp8"` to enable dynamic FP8 FA on supported attention backends |
 | `diffusion_kv_cache_skip_steps` | str \| None | `None` | Denoising step selector to keep in native dtype, for example `"0,1,4-6"` |
 | `diffusion_kv_cache_skip_layers` | str \| None | `None` | Transformer layer selector to keep in native dtype, for example `"0-2,10"` |
@@ -141,3 +141,65 @@ Conflicting per-role and global quantization settings are rejected.
 Minimal T2V deploy configurations are provided in
 `examples/offline_inference/text_to_video/wan22_quant_attention/fa_mxfp8.yaml`
 and `fa_mxfp4.yaml`.
+
+These examples use **40 denoising steps**, with
+`diffusion_kv_cache_skip_steps: "0,1,38,39"` and
+`diffusion_kv_cache_skip_layers: "0,39"`. Selected forwards use floating-point
+Dense attention before considering `quant.fallback`. Steps are zero-based across
+the complete request and do not reset when Wan switches transformers; layer
+indices are local to each transformer. These are fixed indices, not a relative
+"last two steps" selector. Adjust them if the inference step count changes.
+
+### Pinned dependencies
+
+FP8/MXFP8 require the public API at MindIE-SD
+[`cf1a89be5803ad246f26c88c54db89a6a77748d4`](https://gitcode.com/Ascend/MindIE-SD/commit/cf1a89be5803ad246f26c88c54db89a6a77748d4).
+The MXFP4 development reference is the integration fork at
+[`8637b5333b0225381b215390fd09a8732e671cc4`](https://gitcode.com/zqxu/MindIE-SD/commit/8637b5333b0225381b215390fd09a8732e671cc4),
+which includes both the public API and QFA native fixes. This is not an upstream
+release. Build its Python package, PyTorch plugin and custom operators from that
+same revision following its [installation guide](https://gitcode.com/zqxu/MindIE-SD/blob/8637b5333b0225381b215390fd09a8732e671cc4/docs/en/installation.md); copying Python files alone is
+insufficient. MindIE-SD PR 630 supplies the MXFP4 API, not those native fixes.
+
+Use a supported Ascend device and matching CANN/PyTorch/torch_npu stack. For each
+qualification run, record the Omni and MindIE source commits, wheel SHA256, CANN
+version, device model, `torch`/`torch_npu` versions and loaded native library paths.
+An import check alone does not qualify a dependency build. Until an upstream
+MXFP4 build passes the checks below, keep that mode experimental.
+
+### NPU validation
+
+From the Omni checkout, with the pinned dependency installed and CANN sourced:
+
+```bash
+python -m pytest tests/platforms/npu/quant/test_kv_quant_npu.py \
+    -k real_npu -vv -s -o addopts=''
+```
+
+These tests cover both layouts and D=128, including the Wan sequence length
+75600 and a constant-V reference. A skipped test is not a pass. For a short T2V
+run using the configured 40-step policy (no weight quantization):
+
+```bash
+export WAN_MODEL=/path/to/Wan2.2-T2V-A14B-Diffusers
+export OUT_DIR="$PWD/wan22-attention-validation"
+mkdir -p "$OUT_DIR"
+set -o pipefail
+for precision in mxfp8 mxfp4; do
+    python -u examples/offline_inference/text_to_video/text_to_video.py \
+        --model "$WAN_MODEL" \
+        --deploy-config "examples/offline_inference/text_to_video/wan22_quant_attention/fa_${precision}.yaml" \
+        --num-inference-steps 40 --num-frames 17 --height 384 --width 640 \
+        --prompt "A cat walking through a sunlit garden" --seed 42 \
+        --enable-cpu-offload --vae-use-tiling --enforce-eager \
+        --output "$OUT_DIR/fa_${precision}.mp4" 2>&1 | tee "$OUT_DIR/fa_${precision}.log"
+    result=$?
+    printf 'PROCESS_EXIT_CODE=%s\n' "$result" | tee -a "$OUT_DIR/fa_${precision}.log"
+    if [ "$result" -ne 0 ]; then exit "$result"; fi
+done
+```
+
+For the full Wan geometry, repeat with `--num-frames 81 --height 720 --width 1280`.
+Require the intended runtime in the log, a decodable video and process exit 0.
+Video creation followed by an exit crash is a failure. These are functional
+checks; assess VBench quality separately against a matched floating-point run.

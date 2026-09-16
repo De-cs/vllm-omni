@@ -348,9 +348,13 @@ class Attention(nn.Module):
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
         disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
         dtype = self._kv_cache_dtype
+        policy_keys = ("kv_cache_dtype", "quant_fallback", "rotation_seed", "disable_attention_quant")
+        if dtype is None and not disabled and getattr(self, "_rotation_seed", None) is None:
+            if attn_metadata is None or not any(name in attn_metadata.extra for name in policy_keys):
+                return attn_metadata
         extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
         # Recompute per forward so shared metadata cannot retain another step's policy.
-        for name in ("kv_cache_dtype", "quant_fallback", "rotation_seed", "disable_attention_quant"):
+        for name in policy_keys:
             extra.pop(name, None)
         if disabled or dtype == "float":
             extra["disable_attention_quant"] = True

@@ -66,7 +66,7 @@ def test_invalid_quant_configuration(quant):
 
 
 @pytest.mark.parametrize("method", ["fp8", "mxfp8", "mxfp4"])
-@pytest.mark.parametrize("layout", ["BSND", "BNSD"])
+@pytest.mark.parametrize("layout", [None, "BSND", "BNSD"])
 def test_exact_runtime_layout_scale_seed(runtime, method, layout):
     q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
     if layout == "BNSD":
@@ -75,7 +75,7 @@ def test_exact_runtime_layout_scale_seed(runtime, method, layout):
     assert impl.forward_npu(q, q, q) is q
     args, kwargs = runtime.quant_attention.call_args
     assert args[0] is q  # no unconditional transpose or extra quantization
-    assert kwargs["layout"] == layout and kwargs["scale"] == 0.37 and kwargs["precision"] == method
+    assert kwargs["layout"] == (layout or "BSND") and kwargs["scale"] == 0.37 and kwargs["precision"] == method
     assert "rotation_seed" not in kwargs and "attn_mask" not in kwargs
     if method == "mxfp4":
         assert "q_rot" not in kwargs
@@ -84,18 +84,6 @@ def test_exact_runtime_layout_scale_seed(runtime, method, layout):
 
         assert kwargs["q_rot"] is kwargs["k_rot"]
         torch.testing.assert_close(kwargs["q_rot"], get_quant_attention_rotation(q.device, q.dtype, 64, 425500))
-
-
-def test_mask_is_preserved_for_explicit_float_fallback(runtime, monkeypatch):
-    q = torch.randn(1, 130, 2, 64, dtype=torch.bfloat16)
-    mask = torch.arange(130)[None, :] < 129
-    call = Mock(side_effect=lambda q, k, v, **kw: q)
-    monkeypatch.setattr(runtime, "attention_forward", call, raising=False)
-    flash("mxfp4", ["mxfp8", "float"]).forward_npu(q, q, q, AttentionMetadata(attn_mask=mask))
-    runtime.quant_attention.assert_not_called()
-    forwarded = call.call_args.kwargs["attn_mask"]
-    assert forwarded.shape == (1, 1, 130, 130)
-    assert forwarded[..., :129].all() and not forwarded[..., 129].any()
 
 
 def test_missing_runtime_falls_back_only_when_configured(runtime):
@@ -143,17 +131,19 @@ def test_float_fallback_does_not_drop_packed_boundaries(runtime):
         flash(fallback=["float"]).forward_npu(q, q, q, metadata)
 
 
-@pytest.mark.parametrize("layout", ["BSND", "BNSD"])
-def test_float_fallback_preserves_mask_layout_and_scale(runtime, monkeypatch, layout):
+@pytest.mark.parametrize("layout", [None, "BSND", "BNSD"])
+@pytest.mark.parametrize("method,fallback", [("mxfp8", ["float"]), ("mxfp4", ["mxfp8", "float"])])
+def test_float_fallback_preserves_mask_layout_and_scale(runtime, monkeypatch, layout, method, fallback):
     call = Mock(side_effect=lambda q, k, v, **kw: q)
     monkeypatch.setattr(sys.modules["mindiesd"], "attention_forward", call, raising=False)
     q = torch.randn(1, 130, 2, 96, dtype=torch.bfloat16)
     if layout == "BNSD":
         q = q.transpose(1, 2)
     mask = torch.arange(130)[None, :] < 129
-    flash(fallback=["float"], layout=layout).forward_npu(q, q, q, AttentionMetadata(attn_mask=mask))
+    flash(method, fallback, layout).forward_npu(q, q, q, AttentionMetadata(attn_mask=mask))
+    runtime.quant_attention.assert_not_called()
     kwargs = call.call_args.kwargs
-    assert kwargs["layout"] == layout and kwargs["scale"] == 0.37
+    assert kwargs["layout"] == (layout or "BSND") and kwargs["scale"] == 0.37
     assert kwargs["head_first"] == (layout == "BNSD")
     assert kwargs["attn_mask"].shape == (1, 1, 130, 130)
     assert kwargs["attn_mask"][..., :129].all() and not kwargs["attn_mask"][..., 129].any()
@@ -165,7 +155,7 @@ def test_gpu_variant_only_configuration_is_preserved():
     assert spec.backend_kwargs()["quant"] == {"flashinfer_backend": "trtllm-gen"}
 
 
-@pytest.mark.parametrize("layout", ["BSND", "BNSD"])
+@pytest.mark.parametrize("layout", [None, "BSND", "BNSD"])
 def test_float_fallback_preserves_native_causal_attention(runtime, monkeypatch, layout):
     npu = ModuleType("torch_npu")
     native = Mock(side_effect=lambda q, k, v, **kw: (q, None))
@@ -198,3 +188,65 @@ def test_custom_attention_initialization_keeps_upstream_optout(monkeypatch):
         skip_sequence_parallel=True,
     )
     assert layer.attention is custom and layer._kv_cache_dtype is None
+
+
+def test_legacy_global_fp8_uses_implicit_bsnd(runtime):
+    q = torch.randn(1, 17, 2, 64, dtype=torch.bfloat16)
+    impl = flash(layout=None)
+    impl.quant = {}
+    assert impl.forward_npu(q, q, q, AttentionMetadata(extra={"kv_cache_dtype": "fp8"})) is q
+    assert runtime.quant_attention.call_args.kwargs["layout"] == "BSND"
+    assert runtime.quant_attention.call_args.kwargs["precision"] == "fp8"
+
+
+def test_implicit_bsnd_float32_fallback_matches_sdpa(runtime):
+    q = torch.randn(1, 5, 2, 64) * 0.1
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2), q.transpose(1, 2), q.transpose(1, 2), scale=0.37
+    ).transpose(1, 2)
+    torch.testing.assert_close(flash(fallback=["float"], layout=None).forward_npu(q, q, q), expected)
+    runtime.quant_attention.assert_not_called()
+
+
+@pytest.mark.parametrize("dtype,disabled", [(None, False), ("mxfp8", False), ("mxfp8", True), ("float", False)])
+@pytest.mark.parametrize("stale", [False, True])
+def test_policy_metadata_is_copied_only_when_needed(dtype, disabled, stale):
+    layer = object.__new__(layer_mod.Attention)
+    torch.nn.Module.__init__(layer)
+    layer._kv_cache_dtype, layer._disable_kv_quant = dtype, disabled
+    layer._kv_cache_skip_steps = layer._kv_cache_skip_layers = layer._rotation_seed = None
+    layer._quant_fallback = ()
+    keys = {"kv_cache_dtype": "fp8", "quant_fallback": ("float",), "rotation_seed": 1, "disable_attention_quant": True}
+    marker = torch.ones(1)
+    metadata = AttentionMetadata(extra={"unrelated": marker, **(keys if stale else {})})
+    output = layer_mod.Attention._with_kv_cache_dtype(layer, metadata)
+    assert (output is metadata) == (dtype is None and not disabled and not stale)
+    assert output.extra["unrelated"] is marker
+    assert set(metadata.extra) == {"unrelated", *(keys if stale else {})}
+    expected = {"unrelated": marker}
+    if disabled or dtype == "float":
+        expected["disable_attention_quant"] = True
+    elif dtype is not None:
+        expected.update(kv_cache_dtype=dtype, quant_fallback=())
+    assert output.extra == expected
+    fresh = layer_mod.Attention._with_kv_cache_dtype(layer, None)
+    assert (fresh is None) == (dtype is None and not disabled)
+
+
+@pytest.mark.parametrize("layer_idx", [0, 1, 39])
+def test_40_step_policy_is_request_local(runtime, monkeypatch, layer_idx):
+    layer = object.__new__(layer_mod.Attention)
+    torch.nn.Module.__init__(layer)
+    layer.layer_idx, layer._kv_cache_dtype, layer._disable_kv_quant = layer_idx, "mxfp8", False
+    layer._kv_cache_skip_steps, layer._kv_cache_skip_layers = {0, 1, 38, 39}, {0, 39}
+    ctx = SimpleNamespace(denoise_step_idx=0)
+    monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(layer_mod, "get_forward_context", lambda: ctx)
+    source = AttentionMetadata()
+    for step in list(range(40)) * 2:
+        ctx.denoise_step_idx = step
+        output = layer._with_kv_cache_dtype(source)
+        disabled = step in {0, 1, 38, 39} or layer_idx in {0, 39}
+        assert bool(output.extra.get("disable_attention_quant")) == disabled
+        assert output.extra.get("kv_cache_dtype") == (None if disabled else "mxfp8")
+    assert source.extra == {}
