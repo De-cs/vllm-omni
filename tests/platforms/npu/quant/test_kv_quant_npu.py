@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Unit tests for NPU FP8 KV quantization helpers.
+"""Tests for seeded rotations and the quantized NPU attention backend.
 
 These tests load ``kv_quant_npu`` from its source file via ``importlib`` so
 the test module itself does not ``import vllm_omni`` (which would pull
@@ -59,32 +59,6 @@ def _npu_smoke_available() -> bool:
 npu_smoke = pytest.mark.skipif(not _npu_smoke_available(), reason="NPU device or torch_npu not available.")
 
 
-def test_is_quantized_kv_cache() -> None:
-    assert kv_quant_npu.is_quantized_kv_cache("fp8")
-    assert not kv_quant_npu.is_quantized_kv_cache(None)
-    assert not kv_quant_npu.is_quantized_kv_cache("int8")
-
-
-@pytest.mark.parametrize("layout,shape", [("BSND", (1, 128, 2, 64)), ("BNSD", (1, 2, 128, 64))])
-def test_compatibility_wrapper_delegates(monkeypatch, layout, shape):
-    import sys
-    from unittest.mock import Mock
-
-    runtime = Mock(side_effect=lambda q, k, v, **kwargs: q)
-    module = ModuleType("mindiesd")
-    monkeypatch.setattr(module, "quant_attention", runtime, raising=False)
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    q = torch.randn(shape, dtype=torch.bfloat16)
-    assert kv_quant_npu.fp8_rotate_quant_fa(q, q, q, layout=layout, softmax_scale=0.25) is q
-    assert runtime.call_args.args[0] is q
-    kwargs = runtime.call_args.kwargs
-    assert kwargs["layout"] == layout and kwargs["scale"] == 0.25 and kwargs["precision"] == "fp8"
-    assert kwargs["q_rot"] is kwargs["k_rot"]
-    torch.testing.assert_close(
-        kwargs["q_rot"], kv_quant_npu.get_quant_attention_rotation(q.device, q.dtype, 64, 425500)
-    )
-
-
 def test_rotation_is_seeded_orthogonal_cached_and_preserves_rng():
     kv_quant_npu.get_quant_attention_rotation.cache_clear()
     before = torch.random.get_rng_state()
@@ -94,18 +68,6 @@ def test_rotation_is_seeded_orthogonal_cached_and_preserves_rng():
     assert torch.equal(before, torch.random.get_rng_state())
     other = kv_quant_npu.get_quant_attention_rotation(torch.device("cpu"), torch.float32, 64, 12)
     assert not torch.equal(rot, other)
-
-
-@npu_smoke
-@pytest.mark.parametrize("layout", ["BSND", "BNSD"])
-def test_fp8_rotate_quant_fa_real_npu_shape_contract(layout):
-    pytest.importorskip("mindiesd")
-    query = torch.randn(1, 256, 2, 64, dtype=torch.float16, device="npu")
-    if layout == "BNSD":
-        query = query.transpose(1, 2)
-    out = kv_quant_npu.fp8_rotate_quant_fa(query, query, query, layout=layout)
-    assert out.shape == query.shape and out.dtype == query.dtype
-    assert torch.isfinite(out).all()
 
 
 @npu_smoke

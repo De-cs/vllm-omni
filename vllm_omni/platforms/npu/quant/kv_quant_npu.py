@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Compatibility entrypoints for MindIE-SD Q/K/V quantization.
-
-Omni supplies its seeded rotations; MindIE-SD owns quantization and execution.
-"""
+"""Seeded rotation matrices for MindIE-SD quantized attention."""
 
 from __future__ import annotations
 
@@ -11,10 +8,6 @@ import functools
 import math
 
 import torch
-
-
-def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
-    return kv_cache_dtype in {"fp8", "mxfp8", "mxfp4"}
 
 
 @functools.lru_cache(maxsize=128)
@@ -34,29 +27,3 @@ def get_quant_attention_rotation(
         hadamard = torch.cat((torch.cat((hadamard, hadamard), dim=1), torch.cat((hadamard, -hadamard), dim=1)), dim=0)
     rotation = signs[:, None] * hadamard / math.sqrt(head_dim)
     return rotation.to(device=device, dtype=dtype).contiguous()
-
-
-def fp8_rotate_quant_fa(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    *,
-    layout: str = "BNSD",
-    softmax_scale: float | None = None,
-) -> torch.Tensor:
-    """Preserve the legacy layout/scale API and Omni rotation seed."""
-    try:
-        from mindiesd import quant_attention
-    except ImportError as exc:
-        raise ImportError("NPU FP8 attention requires MindIE-SD quant_attention.") from exc
-    rotation = get_quant_attention_rotation(query.device, query.dtype, query.shape[-1])
-    return quant_attention(
-        query,
-        key,
-        value,
-        precision="fp8",
-        layout=layout,
-        scale=softmax_scale,
-        q_rot=rotation,
-        k_rot=rotation,
-    )
