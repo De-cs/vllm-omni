@@ -557,7 +557,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             reason = "piecewise attention requires the float attention path"
         elif attn_metadata is not None and attn_metadata.attn_mask is not None:
             reason = "caller masks require the float attention path"
-        elif method in ("fp8", "mxfp8") and (
+        elif method in ("fp8", "mxfp8", "mxfp4") and (
             query.ndim != 4 or query.shape[-1] <= 0 or query.shape[-1] & (query.shape[-1] - 1)
         ):
             reason = "generated Hadamard rotations require a four-dimensional input and power-of-two head size"
@@ -589,8 +589,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "fallback is not performed."
             ) from exc
         kwargs = dict(precision=method, layout=layout, scale=self.softmax_scale)
-        # The function does not generate rotations. Retain Omni's existing FP8/MXFP8 policy.
-        if method in ("fp8", "mxfp8"):
+        # Apply Omni's deterministic Q/K rotation before every Dense quantized path.
+        if method in ("fp8", "mxfp8", "mxfp4"):
             from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
 
             rotation = get_quant_attention_rotation(query.device, query.dtype, query.shape[-1])

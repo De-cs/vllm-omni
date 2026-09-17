@@ -76,13 +76,10 @@ def test_exact_runtime_layout_scale_and_rotation(runtime, method, layout):
     assert args[0] is q  # no unconditional transpose or extra quantization
     assert kwargs["layout"] == (layout or "BSND") and kwargs["scale"] == 0.37 and kwargs["precision"] == method
     assert "attn_mask" not in kwargs
-    if method == "mxfp4":
-        assert "q_rot" not in kwargs
-    else:
-        from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
+    from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
 
-        assert kwargs["q_rot"] is kwargs["k_rot"]
-        torch.testing.assert_close(kwargs["q_rot"], get_quant_attention_rotation(q.device, q.dtype, 64))
+    assert kwargs["q_rot"] is kwargs["k_rot"]
+    torch.testing.assert_close(kwargs["q_rot"], get_quant_attention_rotation(q.device, q.dtype, 64))
 
 
 def test_missing_runtime_requires_config_change(runtime):
@@ -100,10 +97,11 @@ def test_operator_failure_never_falls_back(runtime):
     runtime.quant_attention.assert_called_once()
 
 
-def test_unsupported_shape_requires_config_change(runtime):
+@pytest.mark.parametrize("method", ["fp8", "mxfp8", "mxfp4"])
+def test_unsupported_shape_requires_config_change(runtime, method):
     q = torch.randn(1, 128, 2, 96, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="diffusion_kv_cache_dtype"):
-        flash().forward_npu(q, q, q, AttentionMetadata(extra={"kv_cache_dtype": "mxfp8"}))
+        flash().forward_npu(q, q, q, AttentionMetadata(extra={"kv_cache_dtype": method}))
     runtime.quant_attention.assert_not_called()
 
 

@@ -72,10 +72,8 @@ def test_omni_calls_real_dense_public_api(monkeypatch, precision, layout, batch,
         qkv_layout=layout,
     )
     output = impl.forward_npu(query, key, value, AttentionMetadata(extra={"kv_cache_dtype": precision}))
-    expected = query
-    if precision != "mxfp4":
-        rotation = get_quant_attention_rotation(query.device, query.dtype, 64)
-        expected = query @ rotation
+    rotation = get_quant_attention_rotation(query.device, query.dtype, 64)
+    expected = query @ rotation
     torch.testing.assert_close(output, expected)
     assert output.shape == query.shape and len(quantized_inputs) == 3
     execute.assert_called_once()
