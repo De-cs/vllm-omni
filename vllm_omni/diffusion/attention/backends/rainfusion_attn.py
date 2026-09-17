@@ -501,9 +501,7 @@ class RainFusionAttentionImpl(AttentionImpl):
                 reason = "quantized multi-video RainFusion is not supported"
             elif requested in ("fp8", "mxfp4") and query.shape[0] != 1:
                 reason = "quantized Wan BSA requires batch size 1"
-            elif requested in ("fp8", "mxfp4") and (
-                query.shape[-1] < 64 or query.shape[-1] & (query.shape[-1] - 1)
-            ):
+            elif requested in ("fp8", "mxfp4") and (query.shape[-1] < 64 or query.shape[-1] & (query.shape[-1] - 1)):
                 reason = "BSA Hadamard rotations require a power-of-two head dimension of at least 64"
         if reason is not None:
             raise ValueError(
