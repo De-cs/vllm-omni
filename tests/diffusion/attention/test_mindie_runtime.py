@@ -298,7 +298,7 @@ def test_bsa_uses_requested_precision_without_dense_precheck_or_native_query(run
     monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
     q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
     impl = sparse(quant={"method": method})
-    impl.dense_fallback._quant_unsupported_reason = Mock(side_effect=AssertionError("dense precheck called"))
+    impl.dense_fallback._validate_quant_request = Mock(side_effect=AssertionError("dense precheck called"))
     assert impl.forward_npu(q, q, q, video_metadata()) is not None
     assert runtime.sparse_attention.call_args.kwargs["precision"] == method
     runtime.sparse_attention.assert_called_once()

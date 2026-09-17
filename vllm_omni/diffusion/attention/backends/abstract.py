@@ -160,8 +160,8 @@ class VideoTokenLayout:
     A model that packs its sequence as ``[prefix | t*h*w video rows | padding]``
     publishes this so backends can recover spatiotemporal locality; the prefix
     holds everything that is not video (text, visual conditions, audio).
-    Publishing ``used_len`` also asserts that any ``attn_mask`` masks only the
-    trailing padding, so a backend may trim tensors to that length.
+    Publishing it also asserts that any ``attn_mask`` masks only the trailing
+    padding, so ``prefix_len + t*h*w`` is the used length of the sequence.
 
     ``prefix_len``/``latent_grid`` retain the original one-tail contract. A
     Ref2VA layout instead publishes ``used_len`` and every physical video

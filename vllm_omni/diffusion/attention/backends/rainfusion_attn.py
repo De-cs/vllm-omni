@@ -74,25 +74,6 @@ def _mindiesd_supports_precision() -> bool:
         return False
 
 
-def _bsa_unsupported_reason(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> str | None:
-    """Check the BSA contract independently of Dense FIA's geometry limits."""
-    tensors = (query, key, value)
-    if any(t.ndim != 4 or t.dtype not in (torch.float16, torch.bfloat16) for t in tensors):
-        return "quantized BSA requires four-dimensional BF16/FP16 tensors"
-    if key.shape != query.shape or value.shape != query.shape or any(dim == 0 for dim in query.shape):
-        return "quantized BSA requires nonempty identical BSND Q/K/V shapes"
-    if any(t.dtype != query.dtype or t.device != query.device for t in tensors):
-        return "Q/K/V devices and dtypes must match"
-    # RFv3 FP8 squeezes the batch before block quantization. Keep the Wan
-    # quantized BSA integration at batch one until larger batches are qualified.
-    if query.shape[0] != 1:
-        return "quantized Wan BSA requires batch size 1"
-    dim = query.shape[-1]
-    if dim < 64 or dim & (dim - 1):
-        return "BSA Hadamard rotations require a power-of-two head dimension of at least 64"
-    return None
-
-
 def _try_extract_layer_index(prefix: str) -> int | None:
     if not prefix:
         return None
@@ -518,8 +499,12 @@ class RainFusionAttentionImpl(AttentionImpl):
                 reason = "MindIE-SD sparse_attention must explicitly support precision"
             elif plan.video_spans is not None:
                 reason = "quantized multi-video RainFusion is not supported"
-            elif requested in ("fp8", "mxfp4"):
-                reason = _bsa_unsupported_reason(query, key, value)
+            elif requested in ("fp8", "mxfp4") and query.shape[0] != 1:
+                reason = "quantized Wan BSA requires batch size 1"
+            elif requested in ("fp8", "mxfp4") and (
+                query.shape[-1] < 64 or query.shape[-1] & (query.shape[-1] - 1)
+            ):
+                reason = "BSA Hadamard rotations require a power-of-two head dimension of at least 64"
         if reason is not None:
             raise ValueError(
                 f"RainFusion precision {requested!r} is unavailable: {reason}. "

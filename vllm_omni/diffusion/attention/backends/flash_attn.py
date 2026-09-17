@@ -80,8 +80,12 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     # To enable a method on a new platform, add its OmniPlatformEnum value here
     # and handle kv_cache_dtype in the corresponding forward_{platform}().
     #
-    # Static quantization policy comes from backend_kwargs. The per-forward
-    # kv_cache_dtype only selects that policy or the float path for skips.
+    # TODO(quant-backend): The quantized path currently lives inside
+    # FlashAttentionImpl and is selected by backend configuration and
+    # ``attn_metadata.extra["kv_cache_dtype"]``. Eventually extract it into a
+    # dedicated FlashAttentionQuantBackend so backend selection decides quant.
+    # Until then, model authors can opt a specific Attention layer out via
+    # ``Attention(disable_kv_quant=True)``.
     _supported_kv_cache_dtypes = {
         "npu": {"fp8", "mxfp8", "mxfp4"},
     }
@@ -106,14 +110,10 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self.is_cross_attn = role == "cross"
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
-        backend_kwargs = backend_kwargs or {}
-        quant_config = backend_kwargs.get("quant")
-        self.quant = dict(quant_config) if quant_config is not None else {}
+        quant_config = backend_kwargs.get("quant") if backend_kwargs else None
+        self.quant = dict(quant_config) if quant_config else {}
         if self.quant and not current_omni_platform.is_npu():
             raise ValueError("FlashAttention quant.method is supported only on NPU.")
-        unknown = set(backend_kwargs) - {"quant"}
-        if unknown:
-            logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", sorted(unknown))
 
     def _warn_fa_deterministic_non_dense(self, path: str) -> None:
         if not self.fa_deterministic:
@@ -543,47 +543,33 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         return quant_attention
 
-    def _quant_unsupported_reason(
+    def _validate_quant_request(
         self,
         method: str,
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
-    ) -> str | None:
-        layout = self.qkv_layout or "BSND"
-        if method not in ("fp8", "mxfp8", "mxfp4"):
-            return "supported quantized methods are fp8, mxfp8, and mxfp4"
-        if layout not in ("BSND", "BNSD"):
-            return "quantized FA requires BSND or BNSD layout"
-        if self.causal:
-            return "causal quantized FA is not supported"
+    ) -> None:
         extra = attn_metadata.extra if attn_metadata else {}
-        if any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k")) or extra.get("npu_attn_varlen"):
-            return "packed/varlen metadata requires the float attention path"
-        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
-            return "piecewise attention requires the float attention path"
-        if any(t.ndim != 4 or t.dtype not in (torch.float16, torch.bfloat16) for t in (query, key, value)):
-            return "quantized FA requires four-dimensional BF16/FP16 tensors"
-        if key.shape != value.shape or query.shape[0] != key.shape[0] or query.shape[-1] != key.shape[-1]:
-            return "incompatible Q/K/V geometry"
-        if any(t.device != query.device or t.dtype != query.dtype for t in (key, value)):
-            return "Q/K/V devices and dtypes must match"
-        if any(dim == 0 for t in (query, key, value) for dim in t.shape):
-            return "empty sequences or tensor dimensions are not supported"
-        head_axis = 2 if layout == "BSND" else 1
-        if query.shape[head_axis] % key.shape[head_axis]:
-            return "Q head count must be a positive multiple of K/V head count"
-        dim = query.shape[-1]
-        if method in ("fp8", "mxfp8") and dim & (dim - 1):
-            return "generated Hadamard rotations require a power-of-two head dimension"
-        if method == "fp8" and query.shape[0] != 1:
-            return "block-FP8 Runtime requires batch size 1"
-        mask = attn_metadata.attn_mask if attn_metadata else None
-        if mask is not None:
-            # The minimal public quantized API has no qualified caller-mask path.
-            return "caller masks require the float attention path"
-        return None
+        reason = None
+        if self.causal:
+            reason = "causal quantized FA is not supported"
+        elif any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k")) or extra.get("npu_attn_varlen"):
+            reason = "packed/varlen metadata requires the float attention path"
+        elif attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            reason = "piecewise attention requires the float attention path"
+        elif attn_metadata is not None and attn_metadata.attn_mask is not None:
+            reason = "caller masks require the float attention path"
+        elif method in ("fp8", "mxfp8") and (
+            query.ndim != 4 or query.shape[-1] <= 0 or query.shape[-1] & (query.shape[-1] - 1)
+        ):
+            reason = "generated Hadamard rotations require a four-dimensional input and power-of-two head size"
+        if reason is not None:
+            raise ValueError(
+                f"NPU attention quant.method={method!r} is unavailable: {reason}. "
+                "Update diffusion_attention_config for this role to select a supported "
+                "quant.method, or set quant.method to 'float'. Automatic precision "
+                "fallback is not performed."
+            )
 
     def forward_fa_quant_npu(
         self,
@@ -595,14 +581,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         extra = attn_metadata.extra if attn_metadata else {}
         method = extra.get("kv_cache_dtype", self.quant.get("method", "fp8"))
         layout = self.qkv_layout or "BSND"
-        reason = self._quant_unsupported_reason(method, query, key, value, attn_metadata)
-        if reason is not None:
-            raise ValueError(
-                f"NPU attention quant.method={method!r} is unavailable: {reason}. "
-                "Update diffusion_attention_config for this role to select a supported "
-                "quant.method, or set quant.method to 'float'. Automatic precision "
-                "fallback is not performed."
-            )
+        self._validate_quant_request(method, query, attn_metadata)
         try:
             runtime = self._load_quant_runtime(method)
         except ImportError as exc:
