@@ -2,18 +2,16 @@
 
 ## Overview
 
-In DiT-based image and video generation, Flash Attention can take a large share
-of denoising time, especially for high-resolution or long-frame workloads.
-vLLM-Omni supports online FP8 quantization for eligible diffusion Flash
-Attention (FA) to reduce FA latency while keeping model weights in their
-original dtype.
+In DiT-based image and video generation, attention can take a large share of
+denoising time, especially for high-resolution or long-frame workloads.
+vLLM-Omni supports online Q/K/V quantization for eligible diffusion attention
+paths while keeping model weights in their original dtype.
 
-This feature is configured through `diffusion_kv_cache_dtype` on
-`OmniDiffusionConfig` (CLI: `--diffusion-kv-cache-dtype`). It is intentionally
-**not** the same as vLLM's `--kv-cache-dtype`, which controls autoregressive
-language-model KV cache storage and defaults to `"auto"`. Diffusion FA
-quantization uses the dedicated diffusion flags so omni serve does not inherit
-that default.
+Legacy FP8 is configured through `diffusion_kv_cache_dtype` on
+`OmniDiffusionConfig` (CLI: `--diffusion-kv-cache-dtype`). Per-role
+`quant.method` selects the Dense or BSA methods described below. These settings
+are separate from vLLM's `--kv-cache-dtype`, which controls autoregressive
+language-model KV cache storage.
 
 In vLLM-Omni diffusion pipelines, this is a runtime FA path: Q/K/V tensors are
 dynamically quantized before the attention operator. It does not quantize model
@@ -25,18 +23,17 @@ attention runs in the native dtype.
 
 ## Hardware Support
 
-| Device | FP8 FA |
-|--------|--------|
-| Ascend NPU | ✅ |
-| NVIDIA GPU | ❌ |
-| AMD ROCm | ❌ |
-| Intel XPU | ❌ |
+| Device | Dense FP8 | Dense MXFP8/MXFP4 | BSA FP8/MXFP4 |
+|--------|------------|-------------------|----------------|
+| Ascend NPU | ✅ | ✅ | ✅ |
+| NVIDIA GPU | ❌ | ❌ | ❌ |
+| AMD ROCm | ❌ | ❌ | ❌ |
+| Intel XPU | ❌ | ❌ | ❌ |
 
 Legend: `✅` supported, `❌` unsupported.
 
-FP8 FA is currently implemented only for the NPU Flash Attention backend. Other
-backends do not support `diffusion_kv_cache_dtype="fp8"` for diffusion attention
-and reject an incompatible explicit configuration.
+These runtime methods are implemented only by the NPU Flash Attention and BSA
+backends. Other backends reject an incompatible explicit configuration.
 
 ## Model Type Support
 
@@ -44,7 +41,7 @@ and reject an incompatible explicit configuration.
 
 | Model | Scope | Status | Notes |
 |-------|-------|--------|-------|
-| Wan2.2 | Eligible DiT full-attention FA on Ascend NPU | Tested | Compare quality and latency against a BF16 baseline before production use |
+| Wan2.2 | Self-attention on Ascend NPU | NPU interface and T2V smoke tested | Compare quality and latency against a BF16 baseline before production use |
 | Other diffusion models | Eligible DiT full-attention FA on Ascend NPU | Not tested | You can try `diffusion_kv_cache_dtype="fp8"`; tune `diffusion_kv_cache_skip_steps` and `diffusion_kv_cache_skip_layers` when higher precision is needed |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
@@ -127,14 +124,15 @@ layers skip FP8 FA; all other eligible full-attention forwards use the FP8 path.
 ## Wan2.2 T2V quantized attention on Ascend
 
 Wan2.2 T2V A14B supports quantized self-attention through MindIE-SD. Model
-weights are unchanged, and cross-attention should remain at `float`.
+weights are unchanged. Cross-attention is not quantized, so omit `quant` from
+the cross-attention role.
 
 | Attention path | `backend` | Supported `quant.method` |
 | --- | --- | --- |
 | Dense FA | `FLASH_ATTN` | `fp8`, `mxfp8`, `mxfp4` |
 | BSA | `RAINFUSION_ATTN` | `fp8`, `mxfp4` |
 
-Configure the self-attention role in the model's deployment YAML:
+Configure only the self-attention role in the model's deployment YAML:
 
 ```yaml
 diffusion_attention_config:
@@ -145,10 +143,6 @@ diffusion_attention_config:
         method: mxfp8
         skip_layers: "0,39"
         skip_steps: "0,1,38,39"
-    cross:
-      backend: FLASH_ATTN
-      quant:
-        method: float
 ```
 
 For 40 denoising steps, `skip_steps: "0,1,38,39"` and
@@ -163,24 +157,21 @@ selector inherits the global value, and `[]` clears it for that role. Unsupporte
 precision/input combinations raise an error and must be corrected in the
 configuration; operator errors are not retried with another precision.
 
-### Requirements and validation
+For BSA, change the backend to `RAINFUSION_ATTN` and use `fp8` or `mxfp4`.
+See [RainFusion attention](../diffusion/attention_backends/rainfusion.md) for
+sparse-path configuration and behavior.
 
-Until the required APIs and native fixes are available in a MindIE-SD release,
-use MindIE-SD revision
+### Requirement and interface test
+
+Until these APIs are available in a MindIE-SD release, use revision
 [`8637b5333b0225381b215390fd09a8732e671cc4`](https://gitcode.com/zqxu/MindIE-SD/commit/8637b5333b0225381b215390fd09a8732e671cc4).
-Build its Python package, PyTorch plugin, and custom operators from the same
-checkout. BSA also requires RFv3 `sparse_attention` precision support; see
-[RainFusion attention](../diffusion/attention_backends/rainfusion.md).
-
-With CANN sourced and that MindIE-SD build installed, run the NPU interface
-tests from the Omni checkout:
+Build the Python package, PyTorch plugin, and custom operators from that same
+checkout. With CANN sourced, run the NPU interface tests from the Omni checkout:
 
 ```bash
 python -m pytest tests/platforms/npu/quant/test_kv_quant_npu.py \
     -k real_npu -vv -s -o addopts=''
 ```
 
-A skipped NPU test is not a pass. Also run the existing Wan2.2 T2V example with
-the deployment policy above, confirm the intended Dense or BSA runtime in the
-log, require process exit 0 and a decodable video, and compare quality with a
-floating-point run using the same prompt, seed, resolution, and step count.
+A skipped NPU test is not a pass. Validate generated video quality against a
+floating-point run with the same prompt, seed, resolution, and step count.
