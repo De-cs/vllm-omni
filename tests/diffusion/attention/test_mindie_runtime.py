@@ -138,6 +138,22 @@ def test_global_quant_method_is_published_per_forward(runtime, monkeypatch, meth
     assert layer._with_kv_cache_dtype(None).extra["kv_cache_dtype"] == method
 
 
+@pytest.mark.parametrize("method", [None, "auto", "float"])
+def test_optout_without_quant_policy_keeps_metadata_unchanged(runtime, monkeypatch, method):
+    layer = make_layer(runtime, monkeypatch)
+    layer._disable_kv_quant = True
+    layer._init_kv_cache_quantization(
+        SimpleNamespace(
+            diffusion_kv_cache_dtype=method,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+            parallel_config=SimpleNamespace(ring_degree=1),
+        )
+    )
+    source = video_metadata()
+    assert layer._with_kv_cache_dtype(source) is source
+
+
 def test_step_skip_is_request_local_and_cross_optout(runtime, monkeypatch):
     layer = make_layer(runtime, monkeypatch)
     ctx = SimpleNamespace(denoise_step_idx=0)

@@ -338,7 +338,11 @@ class Attention(nn.Module):
 
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
         disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
-        dtype = "float" if disabled or self._kv_cache_dtype == "float" else self._kv_cache_dtype
+        dtype = self._kv_cache_dtype
+        if dtype in (None, "float"):
+            dtype = None
+        elif disabled:
+            dtype = "float"
         if dtype is None and (attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra):
             return attn_metadata
         extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
