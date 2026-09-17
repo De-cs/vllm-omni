@@ -176,7 +176,7 @@ class RainFusionAttentionImpl(AttentionImpl):
     irregular video tail internally, retaining it outside the sparse blocks.
     """
 
-    _supported_quant_kv_cache_dtypes = {"npu": {"fp8", "mxfp4"}}
+    _supported_kv_cache_dtypes = {"npu": {"fp8", "mxfp8", "mxfp4"}}
 
     def __init__(
         self,

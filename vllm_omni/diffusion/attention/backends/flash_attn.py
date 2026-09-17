@@ -86,7 +86,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     # backend selection decides quant.
     # Until then, model authors can opt a specific Attention layer out via
     # ``Attention(disable_kv_quant=True)``.
-    _supported_quant_kv_cache_dtypes = {
+    _supported_kv_cache_dtypes = {
         "npu": {"fp8", "mxfp8", "mxfp4"},
     }
 
