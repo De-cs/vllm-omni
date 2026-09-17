@@ -160,8 +160,8 @@ class VideoTokenLayout:
     A model that packs its sequence as ``[prefix | t*h*w video rows | padding]``
     publishes this so backends can recover spatiotemporal locality; the prefix
     holds everything that is not video (text, visual conditions, audio).
-    Publishing it also asserts that any ``attn_mask`` masks only the trailing
-    padding, so ``prefix_len + t*h*w`` is the used length of the sequence.
+    Publishing ``used_len`` also asserts that any ``attn_mask`` masks only the
+    trailing padding, so a backend may trim tensors to that length.
 
     ``prefix_len``/``latent_grid`` retain the original one-tail contract. A
     Ref2VA layout instead publishes ``used_len`` and every physical video
@@ -211,13 +211,6 @@ class AttentionMetadata:
     # Well-known optional keys (convention, not required on all forwards):
     #   "kv_cache_dtype": str | None — quantized KV dtype (e.g. "fp8"); backends
     #     decide whether/how to apply.
-    #   "quant_fallback": ordered alternative Q/K/V methods; no operator-error retries.
-    #   "disable_attention_quant": bool — per-forward skip/model opt-out,
-    #     independent of sparse-vs-dense selection.
-    #   "attn_mask_is_padding": bool -- model guarantees the 2D keep mask only
-    #     excludes alignment padding after video_layout.used_len. Sparse backends
-    #     may trim gathered tensors to that length instead of consuming the mask.
-    #   "rotation_seed": int — explicit seed for Runtime paths supporting rotation.
     #   "cu_seqlens_q" / "cu_seqlens_k": int32 CUDA tensors describing packed
     #     variable-length query/key sequences for FlashAttention.
     #   "max_seqlen_q" / "max_seqlen_k": maximum sequence lengths paired with

@@ -59,15 +59,13 @@ def _npu_smoke_available() -> bool:
 npu_smoke = pytest.mark.skipif(not _npu_smoke_available(), reason="NPU device or torch_npu not available.")
 
 
-def test_rotation_is_seeded_orthogonal_cached_and_preserves_rng():
+def test_rotation_is_fixed_orthogonal_cached_and_preserves_rng():
     kv_quant_npu.get_quant_attention_rotation.cache_clear()
     before = torch.random.get_rng_state()
-    rot = kv_quant_npu.get_quant_attention_rotation(torch.device("cpu"), torch.float32, 64, 425500)
-    assert rot is kv_quant_npu.get_quant_attention_rotation(torch.device("cpu"), torch.float32, 64, 425500)
+    rot = kv_quant_npu.get_quant_attention_rotation(torch.device("cpu"), torch.float32, 64)
+    assert rot is kv_quant_npu.get_quant_attention_rotation(torch.device("cpu"), torch.float32, 64)
     torch.testing.assert_close(rot @ rot.T, torch.eye(64))
     assert torch.equal(before, torch.random.get_rng_state())
-    other = kv_quant_npu.get_quant_attention_rotation(torch.device("cpu"), torch.float32, 64, 12)
-    assert not torch.equal(rot, other)
 
 
 @npu_smoke

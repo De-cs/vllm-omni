@@ -38,7 +38,6 @@ def test_block_publishes_unpadded_grid_without_partial_packed_metadata():
     metadata = block.attn1.call_args.args[2]
     assert metadata.video_layout.latent_grid == (5, 16, 27)
     assert metadata.video_layout.used_len == 2160
-    assert metadata.extra["attn_mask_is_padding"] is True
     assert metadata.video_layout.prefix_len == 0
     assert "max_seqlen_q" not in metadata.extra  # CUDA must not infer incomplete packed varlen.
     assert block.attn2.call_args.args[2] is None

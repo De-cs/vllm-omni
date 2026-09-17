@@ -84,22 +84,24 @@ For common configuration and selector behavior, see the
 `RAINFUSION_ATTN` accepts `quant.method: fp8` or `mxfp4` for Wan2.2 T2V A14B.
 MindIE-SD must expose `sparse_attention` with `rf_v3` and an explicit `precision`
 argument. Omni passes the selected precision directly to this API; the installed
-native operators must support that precision. Unsupported inputs or Python API
-compatibility trigger the configured `quant.fallback` or an error. Native
-execution errors propagate without retry.
-BSA MXFP4 retains MindIE's default rotation. An explicit `rotation_seed` is
-accepted only for FP8 and requires support from the installed sparse API;
-otherwise it follows the same fallback rule.
+native operators must support that precision. Unsupported inputs or an
+incompatible Python API raise an actionable error; Omni does not change BSA
+precision automatically. Update `quant.method` to a precision supported by the
+installed MindIE-SD, or set it to `float`. Native execution errors also
+propagate without retry.
+BSA FP8 and MXFP4 retain MindIE-SD's default rotation policy.
 
-`quant.skip_layers`/`skip_steps`, or a `float` precision fallback, keep attention
-sparse. The existing `block_sparse` warmup/layer exclusions and short-sequence
-threshold instead select Dense attention, using the configured Dense precision.
-The two kinds of fallback are independent; avoid conflicting non-default
-`block_sparse.precision` and `quant.method` settings.
+`quant.skip_layers`/`skip_steps` explicitly select floating-point BSA and keep
+attention sparse. The existing `block_sparse` warmup/layer exclusions and
+short-sequence threshold instead select Dense attention, using the configured
+Dense precision. Avoid conflicting non-default `block_sparse.precision` and
+`quant.method` settings.
 
-Minimal configurations: `wan22_quant_attention/bsa_fp8.yaml` and `bsa_mxfp4.yaml`
-under `examples/offline_inference/text_to_video/`.
-Use `--num-inference-steps 40`: both select `quant.skip_steps: "0,1,38,39"`
-and `quant.skip_layers: "0,39"`. These fixed step indices do not automatically
+Configure BSA quantization in the model's existing deployment YAML with
+`backend: RAINFUSION_ATTN` and `quant.method: fp8` or `mxfp4`. For 40 denoising
+steps, `quant.skip_steps: "0,1,38,39"` and `quant.skip_layers: "0,39"` are
+recommended starting points. These fixed step indices do not automatically
 follow a changed step count. Selected forwards remain floating-point BSA;
-`quant.fallback` is a separate precision fallback chain.
+unsupported BSA precision is an error rather than an automatic fallback. See
+[quantized attention](../../quantization/quantized_kvcache.md#wan22-t2v-quantized-attention-on-ascend)
+for the shared configuration structure and index semantics.

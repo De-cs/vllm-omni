@@ -330,20 +330,21 @@ class RainFusionAttentionImpl(AttentionImpl):
         if attn_metadata is None:
             return None
 
-        # The sparse Runtime constructs its own block mask. It cannot preserve
-        # an arbitrary caller-supplied mask or piecewise visibility constraints.
-        mask = attn_metadata.attn_mask
-        padding_only = attn_metadata.extra.get("attn_mask_is_padding", False)
-        if attn_metadata.full_attn_spans is not None or (
-            mask is not None and not (padding_only and mask.ndim == 2 and mask.dtype == torch.bool)
-        ):
-            return None
         layout = attn_metadata.video_layout
         if layout is None:
             logger.warning_once(
                 "RAINFUSION_ATTN staying dense: this attention role carries no video segment. The "
                 "model must publish AttentionMetadata.video_layout for the sequence to be sparsified."
             )
+            return None
+
+        # The sparse Runtime constructs its own block mask. It cannot preserve
+        # an arbitrary caller-supplied mask or piecewise visibility constraints.
+        mask = attn_metadata.attn_mask
+        padding_only = layout.used_len is not None
+        if attn_metadata.full_attn_spans is not None or (
+            mask is not None and not (padding_only and mask.ndim == 2 and mask.dtype == torch.bool)
+        ):
             return None
         max_seqlen_q = attn_metadata.extra.get("max_seqlen_q", layout.used_len)
         if max_seqlen_q is None:
@@ -506,36 +507,25 @@ class RainFusionAttentionImpl(AttentionImpl):
             raise ValueError(_INCOMPATIBLE_MINDIESD)
         extra = attn_metadata.extra if attn_metadata else {}
         requested = extra.get("kv_cache_dtype", self.quant.get("method", self.rainfusion.precision))
-        fallback = extra.get("quant_fallback", self.quant.get("fallback", ()))
-        rotation_seed = extra.get("rotation_seed", self.quant.get("rotation_seed"))
-        if extra.get("disable_attention_quant"):
-            requested, fallback = "float", ()
-        reasons: list[str] = []
-        precision = None
-        for method in (requested, *fallback):
-            reason = None
-            if method in ("float", "bf16"):
-                precision = "bf16"
-                break
-            if method not in ("fp8", "mxfp4", "mix"):
-                reason = f"sparse {method} is not supported"
+        reason = None
+        if requested in ("float", "bf16"):
+            precision = "bf16"
+        else:
+            precision = requested
+            if requested not in ("fp8", "mxfp4", "mix"):
+                reason = f"sparse {requested} is not supported"
             elif not _mindiesd_supports_precision():
                 reason = "MindIE-SD sparse_attention must explicitly support precision"
             elif plan.video_spans is not None:
                 reason = "quantized multi-video RainFusion is not supported"
-            elif method in ("fp8", "mxfp4"):
+            elif requested in ("fp8", "mxfp4"):
                 reason = _bsa_unsupported_reason(query, key, value)
-            if reason is None and method == "fp8" and rotation_seed is not None:
-                if "rotation_seed" not in inspect.signature(sparse_attention).parameters:
-                    reason = "this MindIE-SD sparse_attention does not support a custom rotation_seed"
-            if reason is None:
-                precision = method
-                break
-            reasons.append(reason)
-        if precision is None:
-            raise ValueError("No supported RainFusion precision: " + "; ".join(reasons))
-        if reasons:
-            logger.warning_once("RainFusion precision fallback to %s: %s", precision, "; ".join(reasons))
+        if reason is not None:
+            raise ValueError(
+                f"RainFusion precision {requested!r} is unavailable: {reason}. "
+                "Update diffusion_attention_config for this role to use a precision supported by the installed "
+                "MindIE-SD, or set quant.method to 'float'. Automatic precision fallback is not performed."
+            )
 
         logger.info_once("RainFusion uses MindIE-SD sparse attention, precision=%s.", precision)
         used = plan.used_len
@@ -551,8 +541,6 @@ class RainFusionAttentionImpl(AttentionImpl):
             "sparsity": self.rainfusion.sparsity,
             "precision": precision,
         }
-        if precision == "fp8" and rotation_seed is not None:
-            common_kwargs["rotation_seed"] = rotation_seed
         if plan.video_spans is not None:
             out = sparse_attention(
                 q,

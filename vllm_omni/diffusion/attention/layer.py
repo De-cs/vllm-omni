@@ -299,8 +299,6 @@ class Attention(nn.Module):
     def _init_kv_cache_quantization(self, config, spec=None) -> None:
         from vllm_omni.diffusion.data import parse_kv_cache_skip_selector
 
-        self._quant_fallback = ()
-        self._rotation_seed = None
         if config is None or self._has_custom_attention:
             return
         dtype = getattr(config, "diffusion_kv_cache_dtype", None)
@@ -313,8 +311,6 @@ class Attention(nn.Module):
             if dtype is not None and dtype != quant.method:
                 raise ValueError("Conflicting diffusion_kv_cache_dtype and per-role quant.method.")
             dtype = quant.method
-            self._quant_fallback = tuple(quant.fallback)
-            self._rotation_seed = quant.rotation_seed
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
         if dtype and dtype != "float":
@@ -335,12 +331,13 @@ class Attention(nn.Module):
         self._kv_cache_skip_steps = getattr(config, "diffusion_kv_cache_skip_step_indices", None)
         self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
         if quant is not None and quant.method is not None:
-            self._kv_cache_skip_steps = (self._kv_cache_skip_steps or set()) | (
-                parse_kv_cache_skip_selector(quant.skip_steps) or set()
-            )
-            self._kv_cache_skip_layers = (self._kv_cache_skip_layers or set()) | (
-                parse_kv_cache_skip_selector(quant.skip_layers) or set()
-            )
+            # Per-role selectors override the corresponding global selector.
+            # An omitted selector inherits the global value; [] explicitly
+            # clears it for this role.
+            if quant.skip_steps is not None:
+                self._kv_cache_skip_steps = parse_kv_cache_skip_selector(quant.skip_steps)
+            if quant.skip_layers is not None:
+                self._kv_cache_skip_layers = parse_kv_cache_skip_selector(quant.skip_layers)
 
         if self._kv_cache_skip_layers and self.layer_idx is None and not self._disable_kv_quant:
             raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
@@ -359,22 +356,14 @@ class Attention(nn.Module):
 
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
         disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
-        dtype = self._kv_cache_dtype
-        policy_keys = ("kv_cache_dtype", "quant_fallback", "rotation_seed", "disable_attention_quant")
-        if dtype is None and not disabled and getattr(self, "_rotation_seed", None) is None:
-            if attn_metadata is None or not any(name in attn_metadata.extra for name in policy_keys):
-                return attn_metadata
+        dtype = "float" if disabled or self._kv_cache_dtype == "float" else self._kv_cache_dtype
+        if dtype is None and (attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra):
+            return attn_metadata
         extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
         # Recompute per forward so shared metadata cannot retain another step's policy.
-        for name in policy_keys:
-            extra.pop(name, None)
-        if disabled or dtype == "float":
-            extra["disable_attention_quant"] = True
-        elif dtype is not None:
+        extra.pop("kv_cache_dtype", None)
+        if dtype is not None:
             extra["kv_cache_dtype"] = dtype
-            extra["quant_fallback"] = getattr(self, "_quant_fallback", ())
-        if not disabled and getattr(self, "_rotation_seed", None) is not None:
-            extra["rotation_seed"] = self._rotation_seed
         if attn_metadata is None:
             return AttentionMetadata(extra=extra) if extra else None
         return replace(attn_metadata, extra=extra)

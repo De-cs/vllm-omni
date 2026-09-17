@@ -765,10 +765,6 @@ class WanTransformerBlock(nn.Module):
         if preserve_vsa_all_blocks:
             self_attn_extra["preserve_vsa_all_blocks"] = True
         video_layout = None
-        if hidden_states_mask is not None:
-            # This model mask only excludes SP alignment padding. Sparse backends
-            # can equivalently trim Q/K/V to video_layout.used_len after gathering.
-            self_attn_extra["attn_mask_is_padding"] = True
         if vsa_dit_seq_shape is not None:
             grid = tuple(int(dim) for dim in vsa_dit_seq_shape)
             # Publish geometry independently of backend selection. Do not add

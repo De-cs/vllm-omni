@@ -131,30 +131,52 @@ For Wan2.2 T2V A14B, `FLASH_ATTN` accepts per-role `quant.method` values
 `quant_attention` API and native operators for the selected precision.
 Keep cross-attention at `float`; model weights are unaffected.
 
-`quant.fallback` is an ordered list, for example `[mxfp8, float]` for MXFP4.
-It applies to unsupported inputs or an unavailable public API, before execution.
-An empty list makes these conditions errors; native execution errors always propagate.
-The list cannot repeat methods and `float`, if present, must be last.
-`quant.rotation_seed` overrides the FP8/MXFP8 rotation seed (default `425500`).
-It is rejected for MXFP4 and `float`, whose Runtime paths do not consume it.
+Dense `FLASH_ATTN` and `RAINFUSION_ATTN` do not change precision automatically.
+An unsupported input or unavailable public API is reported with instructions
+to select another `quant.method` or use `float`; native execution errors
+propagate unchanged. Layer/step selectors are the explicit accuracy fallback
+and do not change the configured precision for other forwards.
 Conflicting per-role and global quantization settings are rejected.
 
-Minimal T2V deploy configurations are provided under
-`examples/offline_inference/text_to_video/wan22_quant_attention/` for
-`fa_mxfp8`, `fa_mxfp4`, `bsa_fp8`, and `bsa_mxfp4`.
+Configure quantized self-attention in the model's existing deployment YAML. For
+example, start with the following policy and select the backend/method pair from
+the table below. Keep cross-attention at `float`.
 
-These examples use **40 denoising steps**, with
-`quant.skip_steps: "0,1,38,39"` and `quant.skip_layers: "0,39"`. Selected forwards use floating-point
-Dense attention before considering `quant.fallback`. Steps are zero-based across
-the complete request and do not reset when Wan switches transformers; layer
-indices are local to each transformer. These are fixed indices, not a relative
-"last two steps" selector. Adjust them if the inference step count changes.
+```yaml
+diffusion_attention_config:
+  per_role:
+    self:
+      backend: FLASH_ATTN
+      quant:
+        method: mxfp8
+        skip_layers: "0,39"
+        skip_steps: "0,1,38,39"
+    cross:
+      backend: FLASH_ATTN
+      quant:
+        method: float
+```
+
+| Attention path | `backend` | Supported `quant.method` |
+| --- | --- | --- |
+| Dense FA | `FLASH_ATTN` | `fp8`, `mxfp8`, `mxfp4` |
+| BSA | `RAINFUSION_ATTN` | `fp8`, `mxfp4` |
+
+For the standard **40 denoising steps**, `quant.skip_steps: "0,1,38,39"`
+and `quant.skip_layers: "0,39"` are recommended starting points. Selected
+forwards use floating-point Dense FA or floating-point BSA. Steps are zero-based
+across the complete request and do not reset when Wan switches transformers;
+layer indices are local to each transformer. These are fixed indices, not a
+relative "last two steps" selector. Adjust them when changing the step count,
+transformer depth, or quality target.
 
 `quant.skip_layers` and `quant.skip_steps` accept index lists or inclusive ranges
-such as `"0,3-5"`; they are combined with the existing global skip selectors.
-An unparsable layer index is an error when layer skips are configured.
-A skipped forward uses floating-point attention before considering
-`quant.fallback`: floating Dense for FA, floating sparse for BSA.
+such as `"0,3-5"`. When set, each per-role selector overrides its corresponding
+global selector; when omitted, it inherits the global value. Use `[]` to clear
+an inherited selector for one role. An unparsable layer index is an error when
+layer skips are configured.
+A skipped forward uses floating-point attention: floating Dense for FA and
+floating sparse for BSA.
 
 ### Pinned dependencies
 
@@ -210,36 +232,34 @@ python -m pytest tests/platforms/npu/quant/test_kv_quant_npu.py \
 
 These tests cover both layouts and D=128, including the Wan sequence length
 75600 and a constant-V reference. A skipped test is not a pass. For a short T2V
-run using the configured 40-step policy (no weight quantization):
+run using an existing deployment YAML configured with the policy above (no
+weight quantization):
 
 ```bash
 export WAN_MODEL=/path/to/Wan2.2-T2V-A14B-Diffusers
+export WAN_DEPLOY_CONFIG=/path/to/wan22-deploy.yaml
 export OUT_DIR="$PWD/wan22-attention-validation"
 mkdir -p "$OUT_DIR"
 set -o pipefail
-for config in fa_mxfp8 fa_mxfp4 bsa_fp8 bsa_mxfp4; do
-    output="$OUT_DIR/${config}.mp4"
-    log="$OUT_DIR/${config}.log"
-    python -u examples/offline_inference/text_to_video/text_to_video.py \
-        --model "$WAN_MODEL" \
-        --deploy-config "examples/offline_inference/text_to_video/wan22_quant_attention/${config}.yaml" \
-        --num-inference-steps 40 --num-frames 17 --height 384 --width 640 \
-        --prompt "A cat walking through a sunlit garden" --seed 42 \
-        --enable-cpu-offload --vae-use-tiling --enforce-eager \
-        --output "$output" 2>&1 | tee "$log"
-    result=$?
-    printf 'PROCESS_EXIT_CODE=%s\n' "$result" | tee -a "$log"
-    if [ "$result" -ne 0 ]; then exit "$result"; fi
-    case "$config" in
-        fa_mxfp8) pattern="NPU attention uses MindIE-SD mxfp8 Runtime" ;;
-        fa_mxfp4) pattern="NPU attention uses MindIE-SD mxfp4 Runtime" ;;
-        bsa_fp8) pattern="RainFusion uses MindIE-SD sparse attention, precision=fp8" ;;
-        bsa_mxfp4) pattern="RainFusion uses MindIE-SD sparse attention, precision=mxfp4" ;;
-    esac
-    grep -F "$pattern" "$log" >/dev/null || exit 1
-    python -c 'import imageio.v3 as iio, sys; assert iio.imread(sys.argv[1], index=0).size' "$output" || exit 1
-done
+output="$OUT_DIR/wan22.mp4"
+log="$OUT_DIR/wan22.log"
+python -u examples/offline_inference/text_to_video/text_to_video.py \
+    --model "$WAN_MODEL" \
+    --deploy-config "$WAN_DEPLOY_CONFIG" \
+    --num-inference-steps 40 --num-frames 17 --height 384 --width 640 \
+    --prompt "A cat walking through a sunlit garden" --seed 42 \
+    --enable-cpu-offload --vae-use-tiling --enforce-eager \
+    --output "$output" 2>&1 | tee "$log"
+result=$?
+printf 'PROCESS_EXIT_CODE=%s\n' "$result" | tee -a "$log"
+if [ "$result" -ne 0 ]; then exit "$result"; fi
+python -c 'import imageio.v3 as iio, sys; assert iio.imread(sys.argv[1], index=0).size' "$output"
 ```
+
+Confirm the selected path in the log: Dense FA reports the configured MindIE-SD
+runtime (`fp8`, `mxfp8`, or `mxfp4`); BSA reports
+`RainFusion uses MindIE-SD sparse attention` with `precision=fp8` or
+`precision=mxfp4`.
 
 For the full Wan geometry, repeat with `--num-frames 81 --height 720 --width 1280`.
 Require the intended runtime in the log, a decodable video and process exit 0.

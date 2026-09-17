@@ -1804,8 +1804,6 @@ class AttnQuantSpec:
 
     # NPU method controls are separate from the existing GPU dtype controls.
     method: str | None = None
-    fallback: list[str] = field(default_factory=list)
-    rotation_seed: int | None = None
     skip_steps: str | list[int] | None = None
     skip_layers: str | list[int] | None = None
 
@@ -1821,24 +1819,8 @@ class AttnQuantSpec:
                 raise ValueError("quant.method cannot be combined with dtype_qk/dtype_vo/flashinfer_backend.")
             if self.q_block_size != 1 or self.k_block_size != 16:
                 raise ValueError("quant.method uses Runtime block sizes; do not set q_block_size/k_block_size.")
-        elif (
-            self.fallback
-            or self.rotation_seed is not None
-            or self.skip_steps is not None
-            or self.skip_layers is not None
-        ):
-            raise ValueError("fallback, rotation_seed and skip selectors require quant.method.")
-        if not isinstance(self.fallback, list) or any(m not in self._VALID_METHODS for m in self.fallback):
-            raise ValueError("quant.fallback must be a list of float/fp8/mxfp8/mxfp4 methods.")
-        chain = ([self.method] if self.method is not None else []) + self.fallback
-        if len(chain) != len(set(chain)) or ("float" in chain and chain[-1] != "float"):
-            raise ValueError("Quantization methods must be unique and float must be the last fallback.")
-        if self.rotation_seed is not None and (
-            isinstance(self.rotation_seed, bool) or not isinstance(self.rotation_seed, int)
-        ):
-            raise ValueError("quant.rotation_seed must be an integer.")
-        if self.rotation_seed is not None and self.method not in ("fp8", "mxfp8"):
-            raise ValueError("quant.rotation_seed is supported only for fp8 and mxfp8 methods.")
+        elif self.skip_steps is not None or self.skip_layers is not None:
+            raise ValueError("skip selectors require quant.method.")
         parse_kv_cache_skip_selector(self.skip_steps)
         parse_kv_cache_skip_selector(self.skip_layers)
         for name, v in (("dtype_qk", self.dtype_qk), ("dtype_vo", self.dtype_vo)):
@@ -1989,9 +1971,7 @@ class AttentionSpec:
                 kw["disabled_until_timestep"] = ss.disabled_until_timestep
         if self.quant is not None and self.quant.method is not None:
             q = self.quant
-            kw["quant"] = {"method": q.method, "fallback": list(q.fallback)}
-            if q.rotation_seed is not None:
-                kw["quant"]["rotation_seed"] = q.rotation_seed
+            kw["quant"] = {"method": q.method}
         elif self.quant is not None:
             q = self.quant
             quant_kw: dict[str, Any] = {}

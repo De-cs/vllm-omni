@@ -69,12 +69,12 @@ def test_omni_calls_real_dense_public_api(monkeypatch, precision, layout, batch,
         head_size=64,
         softmax_scale=0.37,
         qkv_layout=layout,
-        backend_kwargs={"quant": {"method": precision, "fallback": []}},
+        backend_kwargs={"quant": {"method": precision}},
     )
     output = impl.forward_fa_quant_npu(query, key, value)
     expected = query
     if precision != "mxfp4":
-        rotation = get_quant_attention_rotation(query.device, query.dtype, 64, 425500)
+        rotation = get_quant_attention_rotation(query.device, query.dtype, 64)
         expected = query @ rotation
     torch.testing.assert_close(output, expected)
     assert output.shape == query.shape and len(quantized_inputs) == 3
@@ -136,7 +136,7 @@ def test_omni_calls_real_sparse_public_api(monkeypatch, precision, length):
         head_size=64,
         softmax_scale=0.37,
         qkv_layout="BSND",
-        backend_kwargs={"sparsity": 0.8, "quant": {"method": precision, "fallback": []}},
+        backend_kwargs={"sparsity": 0.8, "quant": {"method": precision}},
     )
     plan = rainfusion_attn.RainFusionPlan(used_len=length, prefix_len=0, latent_shape=(1, 1, length))
     try:
