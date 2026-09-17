@@ -1837,6 +1837,8 @@ class AttnQuantSpec:
             isinstance(self.rotation_seed, bool) or not isinstance(self.rotation_seed, int)
         ):
             raise ValueError("quant.rotation_seed must be an integer.")
+        if self.rotation_seed is not None and self.method not in ("fp8", "mxfp8"):
+            raise ValueError("quant.rotation_seed is supported only for fp8 and mxfp8 methods.")
         parse_kv_cache_skip_selector(self.skip_steps)
         parse_kv_cache_skip_selector(self.skip_layers)
         for name, v in (("dtype_qk", self.dtype_qk), ("dtype_vo", self.dtype_vo)):

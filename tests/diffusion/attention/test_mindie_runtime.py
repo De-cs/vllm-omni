@@ -79,6 +79,8 @@ def test_method_configuration_reaches_backend(method):
         {"fallback": ["float"]},
         {"method": "mxfp8", "dtype_qk": "int8"},
         {"method": "fp8", "rotation_seed": True},
+        {"method": "mxfp4", "rotation_seed": 42},
+        {"method": "float", "rotation_seed": 42},
         {"method": "fp8", "skip_steps": "4-2"},
     ],
 )
@@ -97,6 +99,12 @@ def test_gpu_config_and_sparse_mix_preserved():
     )
     with pytest.raises(ValueError, match="Conflicting"):
         AttentionSpec(backend="RAINFUSION_ATTN", block_sparse={"precision": "mix"}, quant={"method": "fp8"})
+
+
+@pytest.mark.parametrize("method", ["fp8", "mxfp8"])
+def test_rotation_seed_is_serialized_only_for_rotating_methods(method):
+    spec = AttentionSpec(backend="FLASH_ATTN", quant={"method": method, "rotation_seed": 42})
+    assert spec.backend_kwargs()["quant"]["rotation_seed"] == 42
 
 
 @pytest.mark.parametrize("method", ["fp8", "mxfp8", "mxfp4"])

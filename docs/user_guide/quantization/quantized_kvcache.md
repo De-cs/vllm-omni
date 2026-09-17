@@ -135,12 +135,13 @@ Keep cross-attention at `float`; model weights are unaffected.
 It applies to unsupported inputs or an unavailable public API, before execution.
 An empty list makes these conditions errors; native execution errors always propagate.
 The list cannot repeat methods and `float`, if present, must be last.
-`quant.rotation_seed` overrides the Dense FP8/MXFP8 rotation seed (default `425500`).
+`quant.rotation_seed` overrides the FP8/MXFP8 rotation seed (default `425500`).
+It is rejected for MXFP4 and `float`, whose Runtime paths do not consume it.
 Conflicting per-role and global quantization settings are rejected.
 
-Minimal T2V deploy configurations are provided in
-`examples/offline_inference/text_to_video/wan22_quant_attention/fa_mxfp8.yaml`
-and `fa_mxfp4.yaml`.
+Minimal T2V deploy configurations are provided under
+`examples/offline_inference/text_to_video/wan22_quant_attention/` for
+`fa_mxfp8`, `fa_mxfp4`, `bsa_fp8`, and `bsa_mxfp4`.
 
 These examples use **40 denoising steps**, with
 `quant.skip_steps: "0,1,38,39"` and `quant.skip_layers: "0,39"`. Selected forwards use floating-point
@@ -157,14 +158,18 @@ A skipped forward uses floating-point attention before considering
 
 ### Pinned dependencies
 
-FP8/MXFP8 require the public API at MindIE-SD
-[`cf1a89be5803ad246f26c88c54db89a6a77748d4`](https://gitcode.com/Ascend/MindIE-SD/commit/cf1a89be5803ad246f26c88c54db89a6a77748d4).
-The MXFP4 development reference is the integration fork at
-[`8637b5333b0225381b215390fd09a8732e671cc4`](https://gitcode.com/zqxu/MindIE-SD/commit/8637b5333b0225381b215390fd09a8732e671cc4),
-which includes both the public API and QFA native fixes. This is not an upstream
-release. Build its Python package, PyTorch plugin and custom operators from that
-same revision following its [installation guide](https://gitcode.com/zqxu/MindIE-SD/blob/8637b5333b0225381b215390fd09a8732e671cc4/docs/en/installation.md); copying Python files alone is
-insufficient. MindIE-SD PR 630 supplies the MXFP4 API, not those native fixes.
+| Purpose | Exact MindIE-SD revision | Status |
+| --- | --- | --- |
+| Official FP8/MXFP8 public API baseline | [`cf1a89be5803ad246f26c88c54db89a6a77748d4`](https://gitcode.com/Ascend/MindIE-SD/commit/cf1a89be5803ad246f26c88c54db89a6a77748d4) | Upstream commit |
+| All four validation configurations below | [`8637b5333b0225381b215390fd09a8732e671cc4`](https://gitcode.com/zqxu/MindIE-SD/commit/8637b5333b0225381b215390fd09a8732e671cc4) | Development integration snapshot with the public APIs and QFA native fixes |
+| MXFP4 API proposed to upstream | [`9cbf9948325f15a6d9c5951389df564432b6d739`](https://gitcode.com/zqxu/MindIE-SD/commit/9cbf9948325f15a6d9c5951389df564432b6d739) ([PR 630](https://gitcode.com/Ascend/MindIE-SD/pull/630)) | API/tests only; it does not contain the QFA native fixes |
+
+Use `8637b5333b0225381b215390fd09a8732e671cc4` for the four-path
+qualification commands in this section until the required native fixes have an
+upstream revision. It is not an upstream release. Build its Python package,
+PyTorch plugin and custom operators from that same checkout following its
+[installation guide](https://gitcode.com/zqxu/MindIE-SD/blob/8637b5333b0225381b215390fd09a8732e671cc4/docs/en/installation.md);
+copying Python files alone is insufficient.
 
 BSA FP8/MXFP4 additionally require `sparse_attention` with an explicit
 `precision` argument and RFv3 support. Omni passes the precision directly;
@@ -182,6 +187,23 @@ MXFP4 build passes the checks below, keep that mode experimental.
 From the Omni checkout, with the pinned dependency installed and CANN sourced:
 
 ```bash
+export MINDIESD_SRC=/path/to/MindIE-SD
+export MINDIESD_REV=8637b5333b0225381b215390fd09a8732e671cc4
+if [ "$(git -C "$MINDIESD_SRC" rev-parse HEAD)" != "$MINDIESD_REV" ]; then
+    echo "MindIE-SD revision does not match $MINDIESD_REV" >&2
+    exit 1
+fi
+
+python - <<'PY'
+import inspect
+import mindiesd
+
+assert callable(mindiesd.quant_attention)
+assert "precision" in inspect.signature(mindiesd.sparse_attention).parameters
+print("mindiesd:", mindiesd.__file__)
+print("sparse_attention:", inspect.signature(mindiesd.sparse_attention))
+PY
+
 python -m pytest tests/platforms/npu/quant/test_kv_quant_npu.py \
     -k real_npu -vv -s -o addopts=''
 ```
@@ -196,16 +218,26 @@ export OUT_DIR="$PWD/wan22-attention-validation"
 mkdir -p "$OUT_DIR"
 set -o pipefail
 for config in fa_mxfp8 fa_mxfp4 bsa_fp8 bsa_mxfp4; do
+    output="$OUT_DIR/${config}.mp4"
+    log="$OUT_DIR/${config}.log"
     python -u examples/offline_inference/text_to_video/text_to_video.py \
         --model "$WAN_MODEL" \
         --deploy-config "examples/offline_inference/text_to_video/wan22_quant_attention/${config}.yaml" \
         --num-inference-steps 40 --num-frames 17 --height 384 --width 640 \
         --prompt "A cat walking through a sunlit garden" --seed 42 \
         --enable-cpu-offload --vae-use-tiling --enforce-eager \
-        --output "$OUT_DIR/${config}.mp4" 2>&1 | tee "$OUT_DIR/${config}.log"
+        --output "$output" 2>&1 | tee "$log"
     result=$?
-    printf 'PROCESS_EXIT_CODE=%s\n' "$result" | tee -a "$OUT_DIR/${config}.log"
+    printf 'PROCESS_EXIT_CODE=%s\n' "$result" | tee -a "$log"
     if [ "$result" -ne 0 ]; then exit "$result"; fi
+    case "$config" in
+        fa_mxfp8) pattern="NPU attention uses MindIE-SD mxfp8 Runtime" ;;
+        fa_mxfp4) pattern="NPU attention uses MindIE-SD mxfp4 Runtime" ;;
+        bsa_fp8) pattern="RainFusion uses MindIE-SD sparse attention, precision=fp8" ;;
+        bsa_mxfp4) pattern="RainFusion uses MindIE-SD sparse attention, precision=mxfp4" ;;
+    esac
+    grep -F "$pattern" "$log" >/dev/null || exit 1
+    python -c 'import imageio.v3 as iio, sys; assert iio.imread(sys.argv[1], index=0).size' "$output" || exit 1
 done
 ```
 

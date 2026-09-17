@@ -525,7 +525,7 @@ class RainFusionAttentionImpl(AttentionImpl):
                 reason = "quantized multi-video RainFusion is not supported"
             elif method in ("fp8", "mxfp4"):
                 reason = _bsa_unsupported_reason(query, key, value)
-            if reason is None and rotation_seed is not None:
+            if reason is None and method == "fp8" and rotation_seed is not None:
                 if "rotation_seed" not in inspect.signature(sparse_attention).parameters:
                     reason = "this MindIE-SD sparse_attention does not support a custom rotation_seed"
             if reason is None:
@@ -551,7 +551,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             "sparsity": self.rainfusion.sparsity,
             "precision": precision,
         }
-        if precision != "bf16" and rotation_seed is not None:
+        if precision == "fp8" and rotation_seed is not None:
             common_kwargs["rotation_seed"] = rotation_seed
         if plan.video_spans is not None:
             out = sparse_attention(

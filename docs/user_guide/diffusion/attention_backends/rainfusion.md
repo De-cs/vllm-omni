@@ -87,8 +87,9 @@ argument. Omni passes the selected precision directly to this API; the installed
 native operators must support that precision. Unsupported inputs or Python API
 compatibility trigger the configured `quant.fallback` or an error. Native
 execution errors propagate without retry.
-BSA retains MindIE's default rotation. An explicit `rotation_seed` requires
-support from the installed sparse API and otherwise follows the same fallback rule.
+BSA MXFP4 retains MindIE's default rotation. An explicit `rotation_seed` is
+accepted only for FP8 and requires support from the installed sparse API;
+otherwise it follows the same fallback rule.
 
 `quant.skip_layers`/`skip_steps`, or a `float` precision fallback, keep attention
 sparse. The existing `block_sparse` warmup/layer exclusions and short-sequence
