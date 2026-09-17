@@ -256,7 +256,7 @@ class Attention(nn.Module):
         self._kv_cache_skip_layers: set[int] | None = None
         # Per-layer opt-out from KV-cache quantization (set by model author).
         self._disable_kv_quant: bool = disable_kv_quant
-        self._init_kv_cache_quantization(config, self.attn_spec)
+        self._init_kv_cache_quantization(config)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         """Return native rank-local geometry for an opted-in paged cache."""
@@ -296,21 +296,12 @@ class Attention(nn.Module):
                 return self._no_parallel_strategy
         return self.parallel_strategy
 
-    def _init_kv_cache_quantization(self, config, spec=None) -> None:
-        from vllm_omni.diffusion.data import parse_kv_cache_skip_selector
-
+    def _init_kv_cache_quantization(self, config) -> None:
         if config is None or self._has_custom_attention:
             return
         dtype = getattr(config, "diffusion_kv_cache_dtype", None)
         if dtype == "auto":
             dtype = None
-        quant = getattr(spec, "quant", None)
-        if quant is not None and quant.method is not None:
-            if not current_omni_platform.is_npu():
-                raise ValueError("Attention quant.method is currently supported only on NPU.")
-            if dtype is not None and dtype != quant.method:
-                raise ValueError("Conflicting diffusion_kv_cache_dtype and per-role quant.method.")
-            dtype = quant.method
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
         if dtype and dtype != "float":
@@ -330,15 +321,6 @@ class Attention(nn.Module):
         self._kv_cache_dtype = dtype
         self._kv_cache_skip_steps = getattr(config, "diffusion_kv_cache_skip_step_indices", None)
         self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
-        if quant is not None and quant.method is not None:
-            # Per-role selectors override the corresponding global selector.
-            # An omitted selector inherits the global value; [] explicitly
-            # clears it for this role.
-            if quant.skip_steps is not None:
-                self._kv_cache_skip_steps = parse_kv_cache_skip_selector(quant.skip_steps)
-            if quant.skip_layers is not None:
-                self._kv_cache_skip_layers = parse_kv_cache_skip_selector(quant.skip_layers)
-
         if self._kv_cache_skip_layers and self.layer_idx is None and not self._disable_kv_quant:
             raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
 

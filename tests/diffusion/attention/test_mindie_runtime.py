@@ -12,9 +12,9 @@ import torch
 from vllm_omni.diffusion.attention import layer as layer_mod
 from vllm_omni.diffusion.attention.backends import flash_attn, rainfusion_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
-from vllm_omni.diffusion.data import AttentionSpec, AttnQuantSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+_DEFAULT_SKIP_STEPS = frozenset({0, 1, 38, 39})
 
 
 @pytest.fixture
@@ -37,13 +37,12 @@ def runtime(monkeypatch):
     supports_precision.cache_clear()
 
 
-def flash(method="mxfp8", layout="BSND"):
+def flash(layout="BSND"):
     return flash_attn.FlashAttentionImpl(
         num_heads=2,
         head_size=64,
         softmax_scale=0.37,
         qkv_layout=layout,
-        backend_kwargs={"quant": {"method": method}},
     )
 
 
@@ -64,39 +63,15 @@ def video_metadata(**extra):
     )
 
 
-@pytest.mark.parametrize("method", ["fp8", "mxfp8", "mxfp4", "float"])
-def test_method_configuration_reaches_backend(method):
-    spec = AttentionSpec(backend="FLASH_ATTN", quant={"method": method})
-    assert spec.quant.enabled
-    assert spec.backend_kwargs()["quant"] == {"method": method}
-
-
-@pytest.mark.parametrize(
-    "quant",
-    [
-        {"method": "invalid"},
-        {"method": "mxfp8", "dtype_qk": "int8"},
-        {"method": "fp8", "skip_steps": "4-2"},
-    ],
-)
-def test_invalid_quant_configuration(quant):
-    with pytest.raises(ValueError):
-        AttnQuantSpec(**quant)
-
-
-def test_sparse_legacy_precision_conflicts_with_quant_method():
-    with pytest.raises(ValueError, match="Conflicting"):
-        AttentionSpec(backend="RAINFUSION_ATTN", block_sparse={"precision": "mix"}, quant={"method": "fp8"})
-
-
 @pytest.mark.parametrize("method", ["fp8", "mxfp8", "mxfp4"])
 @pytest.mark.parametrize("layout", [None, "BSND", "BNSD"])
 def test_exact_runtime_layout_scale_and_rotation(runtime, method, layout):
     q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
     if layout == "BNSD":
         q = q.transpose(1, 2)
-    impl = flash(method, layout=layout)
-    assert impl.forward_npu(q, q, q) is q
+    impl = flash(layout=layout)
+    metadata = AttentionMetadata(extra={"kv_cache_dtype": method})
+    assert impl.forward_npu(q, q, q, metadata) is q
     args, kwargs = runtime.quant_attention.call_args
     assert args[0] is q  # no unconditional transpose or extra quantization
     assert kwargs["layout"] == (layout or "BSND") and kwargs["scale"] == 0.37 and kwargs["precision"] == method
@@ -113,54 +88,34 @@ def test_exact_runtime_layout_scale_and_rotation(runtime, method, layout):
 def test_missing_runtime_requires_config_change(runtime):
     q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
     del runtime.quant_attention
-    with pytest.raises(ImportError, match="select another quant.method"):
-        flash("mxfp4").forward_npu(q, q, q)
+    with pytest.raises(ImportError, match="diffusion_kv_cache_dtype"):
+        flash().forward_npu(q, q, q, AttentionMetadata(extra={"kv_cache_dtype": "mxfp4"}))
 
 
 def test_operator_failure_never_falls_back(runtime):
     q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
     runtime.quant_attention.side_effect = RuntimeError("operator failure")
     with pytest.raises(RuntimeError, match="operator failure"):
-        flash("mxfp4").forward_npu(q, q, q)
+        flash().forward_npu(q, q, q, AttentionMetadata(extra={"kv_cache_dtype": "mxfp4"}))
     runtime.quant_attention.assert_called_once()
 
 
 def test_unsupported_shape_requires_config_change(runtime):
     q = torch.randn(1, 128, 2, 96, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="select a supported quant.method"):
-        flash("mxfp8").forward_npu(q, q, q)
+    with pytest.raises(ValueError, match="diffusion_kv_cache_dtype"):
+        flash().forward_npu(q, q, q, AttentionMetadata(extra={"kv_cache_dtype": "mxfp8"}))
     runtime.quant_attention.assert_not_called()
 
 
 def test_packed_metadata_never_reaches_quant_runtime(runtime):
     q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
-    metadata = AttentionMetadata(extra={"cu_seqlens_q": torch.tensor([0, 64, 128])})
+    metadata = AttentionMetadata(extra={"kv_cache_dtype": "mxfp8", "cu_seqlens_q": torch.tensor([0, 64, 128])})
     with pytest.raises(ValueError, match="packed/varlen"):
         flash().forward_npu(q, q, q, metadata)
     runtime.quant_attention.assert_not_called()
 
 
-def make_layer(runtime, monkeypatch):
-    layer = object.__new__(layer_mod.Attention)
-    torch.nn.Module.__init__(layer)
-    layer.attention = flash()
-    layer.attn_backend = flash_attn.FlashAttentionBackend
-    layer._disable_kv_quant = False
-    layer.layer_idx = 3
-    cfg = SimpleNamespace(diffusion_kv_cache_dtype=None, parallel_config=SimpleNamespace(ring_degree=1))
-    spec = AttentionSpec(backend="FLASH_ATTN", quant={"method": "mxfp8", "skip_steps": "0,1,38,39"})
-    layer._init_kv_cache_quantization(cfg, spec)
-    return layer
-
-
-@pytest.mark.parametrize(
-    "quant,expected_steps,expected_layers",
-    [
-        ({"method": "mxfp8"}, {0, 1}, {2, 3}),
-        ({"method": "mxfp8", "skip_steps": "38,39", "skip_layers": []}, {38, 39}, set()),
-    ],
-)
-def test_role_skip_selectors_override_or_inherit_global(runtime, quant, expected_steps, expected_layers):
+def make_layer(runtime, monkeypatch, method="mxfp8", skip_steps=_DEFAULT_SKIP_STEPS):
     layer = object.__new__(layer_mod.Attention)
     torch.nn.Module.__init__(layer)
     layer.attention = flash()
@@ -168,14 +123,19 @@ def test_role_skip_selectors_override_or_inherit_global(runtime, quant, expected
     layer._disable_kv_quant = False
     layer.layer_idx = 3
     cfg = SimpleNamespace(
-        diffusion_kv_cache_dtype=None,
-        diffusion_kv_cache_skip_step_indices={0, 1},
-        diffusion_kv_cache_skip_layer_indices={2, 3},
+        diffusion_kv_cache_dtype=method,
+        diffusion_kv_cache_skip_step_indices=skip_steps,
+        diffusion_kv_cache_skip_layer_indices=None,
         parallel_config=SimpleNamespace(ring_degree=1),
     )
-    layer._init_kv_cache_quantization(cfg, AttentionSpec(backend="FLASH_ATTN", quant=quant))
-    assert layer._kv_cache_skip_steps == expected_steps
-    assert layer._kv_cache_skip_layers == expected_layers
+    layer._init_kv_cache_quantization(cfg)
+    return layer
+
+
+@pytest.mark.parametrize("method", ["fp8", "mxfp8", "mxfp4"])
+def test_global_quant_method_is_published_per_forward(runtime, monkeypatch, method):
+    layer = make_layer(runtime, monkeypatch, method=method, skip_steps=None)
+    assert layer._with_kv_cache_dtype(None).extra["kv_cache_dtype"] == method
 
 
 def test_step_skip_is_request_local_and_cross_optout(runtime, monkeypatch):
@@ -194,24 +154,19 @@ def test_step_skip_is_request_local_and_cross_optout(runtime, monkeypatch):
     assert layer._with_kv_cache_dtype(source).extra["kv_cache_dtype"] == "float"
 
 
-def test_legacy_conflict_and_ring_rejected(runtime, monkeypatch):
+def test_ring_attention_is_rejected(runtime, monkeypatch):
     layer = make_layer(runtime, monkeypatch)
-    spec = AttentionSpec(backend="FLASH_ATTN", quant={"method": "mxfp8"})
-    cfg = SimpleNamespace(diffusion_kv_cache_dtype="fp8", parallel_config=SimpleNamespace(ring_degree=1))
-    with pytest.raises(ValueError, match="Conflicting"):
-        layer._init_kv_cache_quantization(cfg, spec)
-    cfg.diffusion_kv_cache_dtype = None
-    cfg.parallel_config.ring_degree = 2
+    cfg = SimpleNamespace(diffusion_kv_cache_dtype="mxfp8", parallel_config=SimpleNamespace(ring_degree=2))
     with pytest.raises(ValueError, match="ring"):
-        layer._init_kv_cache_quantization(cfg, spec)
+        layer._init_kv_cache_quantization(cfg)
 
 
 def test_sparse_tail_steps_and_dense_quant_dispatch(runtime, monkeypatch):
     ctx = SimpleNamespace(denoise_step_idx=49, total_denoise_steps=50)
     monkeypatch.setattr(rainfusion_attn, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(rainfusion_attn, "get_forward_context", lambda: ctx)
-    impl = sparse(start_step=2, end_step=2, quant={"method": "fp8"})
-    metadata = video_metadata()
+    impl = sparse(start_step=2, end_step=2)
+    metadata = video_metadata(kv_cache_dtype="fp8")
     assert impl._resolve_plan(metadata) is None
     q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
     impl.forward_npu(q, q, q, metadata)
@@ -223,7 +178,7 @@ def test_sparse_quant_uses_public_runtime(runtime, monkeypatch, method):
     runtime.sparse_attention = Mock(side_effect=lambda q, k, v, **kwargs: q)
     monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
     q = torch.randn(1, 4224, 2, 64, dtype=torch.bfloat16)
-    out = sparse(quant={"method": method}).forward_npu(q, q, q, video_metadata())
+    out = sparse().forward_npu(q, q, q, video_metadata(kv_cache_dtype=method))
     assert out.shape == q.shape and not out[:, 4096:].any()
     kwargs = runtime.sparse_attention.call_args.kwargs
     assert (kwargs["precision"], kwargs["sparse_type"], kwargs["inner_precise"]) == (method, "rf_v3", 4)
@@ -250,7 +205,7 @@ def test_bsa_operator_failure_never_retries(runtime, monkeypatch):
     monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
     q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="BSA operator failure"):
-        sparse(quant={"method": "mxfp4"}).forward_npu(q, q, q, video_metadata())
+        sparse().forward_npu(q, q, q, video_metadata(kv_cache_dtype="mxfp4"))
     runtime.sparse_attention.assert_called_once()
 
 
@@ -269,19 +224,23 @@ def test_invalid_sparse_quant_requires_config_change(runtime, monkeypatch, metho
     monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: supports_precision)
     q = torch.randn(shape, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match=error):
-        sparse(quant={"method": method}).forward_npu(q, q, q, video_metadata())
+        sparse().forward_npu(q, q, q, video_metadata(kv_cache_dtype=method))
     runtime.sparse_attention.assert_not_called()
 
 
 def test_layer_selector_requires_index_except_cross_optout(runtime, monkeypatch):
     layer = make_layer(runtime, monkeypatch)
     layer.layer_idx = None
-    config = SimpleNamespace(diffusion_kv_cache_dtype=None, parallel_config=SimpleNamespace(ring_degree=1))
-    spec = AttentionSpec(backend="FLASH_ATTN", quant={"method": "mxfp8", "skip_layers": "0,3"})
+    config = SimpleNamespace(
+        diffusion_kv_cache_dtype="mxfp8",
+        diffusion_kv_cache_skip_step_indices=None,
+        diffusion_kv_cache_skip_layer_indices={0, 3},
+        parallel_config=SimpleNamespace(ring_degree=1),
+    )
     with pytest.raises(ValueError, match="parseable transformer block index"):
-        layer._init_kv_cache_quantization(config, spec)
+        layer._init_kv_cache_quantization(config)
     layer._disable_kv_quant = True
-    layer._init_kv_cache_quantization(config, spec)
+    layer._init_kv_cache_quantization(config)
     assert layer._with_kv_cache_dtype(None).extra["kv_cache_dtype"] == "float"
 
 
@@ -296,14 +255,16 @@ def test_expert_layer_and_step_skip_remain_sparse(runtime, monkeypatch, prefix, 
     layer = make_layer(runtime, monkeypatch)
     layer.layer_idx = rainfusion_attn._try_extract_layer_index(prefix)
     assert layer.layer_idx == 3
-    config = SimpleNamespace(diffusion_kv_cache_dtype=None, parallel_config=SimpleNamespace(ring_degree=1))
-    spec = AttentionSpec(
-        backend="RAINFUSION_ATTN", quant={"method": method, "skip_layers": "3", "skip_steps": "0,1,38,39"}
+    config = SimpleNamespace(
+        diffusion_kv_cache_dtype=method,
+        diffusion_kv_cache_skip_step_indices={0, 1, 38, 39},
+        diffusion_kv_cache_skip_layer_indices={3},
+        parallel_config=SimpleNamespace(ring_degree=1),
     )
-    impl = sparse(quant={"method": method})
+    impl = sparse()
     layer.attention = impl
     layer.attn_backend = rainfusion_attn.RainFusionAttentionBackend
-    layer._init_kv_cache_quantization(config, spec)
+    layer._init_kv_cache_quantization(config)
     ctx = SimpleNamespace(denoise_step_idx=0)
     monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(layer_mod, "get_forward_context", lambda: ctx)
@@ -339,7 +300,6 @@ def test_custom_attention_initialization_keeps_upstream_optout(monkeypatch):
 def test_legacy_global_fp8_uses_implicit_bsnd(runtime):
     q = torch.randn(1, 17, 2, 64, dtype=torch.bfloat16)
     impl = flash(layout=None)
-    impl.quant = {}
     assert impl.forward_npu(q, q, q, AttentionMetadata(extra={"kv_cache_dtype": "fp8"})) is q
     assert runtime.quant_attention.call_args.kwargs["layout"] == "BSND"
     assert runtime.quant_attention.call_args.kwargs["precision"] == "fp8"

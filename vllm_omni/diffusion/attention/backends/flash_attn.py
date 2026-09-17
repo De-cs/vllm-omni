@@ -81,12 +81,12 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     # and handle kv_cache_dtype in the corresponding forward_{platform}().
     #
     # TODO(quant-backend): The quantized path currently lives inside
-    # FlashAttentionImpl and is selected by backend configuration and
-    # ``attn_metadata.extra["kv_cache_dtype"]``. Eventually extract it into a
-    # dedicated FlashAttentionQuantBackend so backend selection decides quant.
+    # FlashAttentionImpl gated by ``attn_metadata.extra["kv_cache_dtype"]``.
+    # Eventually extract it into a dedicated FlashAttentionQuantBackend so
+    # backend selection decides quant.
     # Until then, model authors can opt a specific Attention layer out via
     # ``Attention(disable_kv_quant=True)``.
-    _supported_kv_cache_dtypes = {
+    _supported_quant_kv_cache_dtypes = {
         "npu": {"fp8", "mxfp8", "mxfp4"},
     }
 
@@ -110,10 +110,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self.is_cross_attn = role == "cross"
         cfg = get_current_diffusion_config_or_none()
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
-        quant_config = backend_kwargs.get("quant") if backend_kwargs else None
-        self.quant = dict(quant_config) if quant_config else {}
-        if self.quant and not current_omni_platform.is_npu():
-            raise ValueError("FlashAttention quant.method is supported only on NPU.")
+        if backend_kwargs:
+            logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
     def _warn_fa_deterministic_non_dense(self, path: str) -> None:
         if not self.fa_deterministic:
@@ -530,7 +528,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """NPU attention implementation using mindiesd."""
 
         extra = attn_metadata.extra if attn_metadata else {}
-        method = extra.get("kv_cache_dtype", self.quant.get("method"))
+        method = extra.get("kv_cache_dtype")
         if method not in (None, "float", "auto"):
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
         return self.forward_fa_npu(query, key, value, attn_metadata)
@@ -565,10 +563,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             reason = "generated Hadamard rotations require a four-dimensional input and power-of-two head size"
         if reason is not None:
             raise ValueError(
-                f"NPU attention quant.method={method!r} is unavailable: {reason}. "
-                "Update diffusion_attention_config for this role to select a supported "
-                "quant.method, or set quant.method to 'float'. Automatic precision "
-                "fallback is not performed."
+                f"NPU attention precision {method!r} is unavailable: {reason}. "
+                "Set diffusion_kv_cache_dtype to a supported method, or set it to "
+                "'auto'. Automatic precision fallback is not performed."
             )
 
     def forward_fa_quant_npu(
@@ -579,16 +576,16 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         extra = attn_metadata.extra if attn_metadata else {}
-        method = extra.get("kv_cache_dtype", self.quant.get("method", "fp8"))
+        method = extra.get("kv_cache_dtype", "fp8")
         layout = self.qkv_layout or "BSND"
         self._validate_quant_request(method, query, attn_metadata)
         try:
             runtime = self._load_quant_runtime(method)
         except ImportError as exc:
             raise ImportError(
-                f"NPU attention quant.method={method!r} requires a compatible MindIE-SD "
+                f"NPU attention precision {method!r} requires a compatible MindIE-SD "
                 "quant Runtime. Install a compatible MindIE-SD build, select another "
-                "quant.method, or set quant.method to 'float'. Automatic precision "
+                "diffusion_kv_cache_dtype, or set it to 'auto'. Automatic precision "
                 "fallback is not performed."
             ) from exc
         kwargs = dict(precision=method, layout=layout, scale=self.softmax_scale)

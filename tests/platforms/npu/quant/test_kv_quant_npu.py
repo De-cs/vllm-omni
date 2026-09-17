@@ -74,6 +74,7 @@ def test_rotation_is_fixed_orthogonal_cached_and_preserves_rng():
 @pytest.mark.parametrize("layout", ["BSND", "BNSD"])
 @pytest.mark.parametrize("seq_len", [256, 75600])
 def test_dense_runtime_backend_real_npu(method, layout, seq_len):
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
     from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 
     # On NPU, missing Runtime symbols must fail this qualification test.
@@ -88,9 +89,9 @@ def test_dense_runtime_backend_real_npu(method, layout, seq_len):
         head_size=128,
         softmax_scale=128**-0.5,
         qkv_layout=layout,
-        backend_kwargs={"quant": {"method": method}},
     )
-    out = impl.forward_npu(query, query, value)
+    metadata = AttentionMetadata(extra={"kv_cache_dtype": method})
+    out = impl.forward_npu(query, query, value, metadata)
     assert out.shape == query.shape and out.dtype == query.dtype
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out.float().cpu(), value.float().cpu(), rtol=0.02, atol=0.02)

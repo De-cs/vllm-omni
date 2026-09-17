@@ -609,8 +609,8 @@ class WanCrossAttention(nn.Module):
             qkv_layout="BSND",
             prefix=prefix,
             skip_sequence_parallel=True,
-            # Wan2.2 cross-attn operates on short text-encoder sequences; per-block
-            # FP8 quant offers no perf win and degrades quality. Opt out until a
+            # Wan2.2 cross-attn operates on short text-encoder sequences; runtime
+            # Q/K/V quantization offers no perf win and degrades quality. Opt out until a
             # dedicated quant backend handles this case.
             disable_kv_quant=True,
         )

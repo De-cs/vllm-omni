@@ -7,10 +7,9 @@ denoising time, especially for high-resolution or long-frame workloads.
 vLLM-Omni supports online Q/K/V quantization for eligible diffusion attention
 paths while keeping model weights in their original dtype.
 
-Legacy FP8 is configured through `diffusion_kv_cache_dtype` on
-`OmniDiffusionConfig` (CLI: `--diffusion-kv-cache-dtype`). Per-role
-`quant.method` selects the Dense or BSA methods described below. These settings
-are separate from vLLM's `--kv-cache-dtype`, which controls autoregressive
+Runtime attention precision is configured through `diffusion_kv_cache_dtype`
+on `OmniDiffusionConfig` (CLI: `--diffusion-kv-cache-dtype`). This setting is
+separate from vLLM's `--kv-cache-dtype`, which controls autoregressive
 language-model KV cache storage.
 
 In vLLM-Omni diffusion pipelines, this is a runtime FA path: Q/K/V tensors are
@@ -18,8 +17,7 @@ dynamically quantized before the attention operator. It does not quantize model
 weights and is separate from [FP8 W8A8](fp8.md), [Int8 W8A8](int8.md), or
 pre-quantized checkpoint formats.
 
-If neither `diffusion_kv_cache_dtype` nor per-role `quant.method` is set,
-attention runs in the native dtype.
+If `diffusion_kv_cache_dtype` is not set, attention runs in the native dtype.
 
 ## Hardware Support
 
@@ -102,12 +100,13 @@ The legacy keyword aliases `kv_cache_dtype`, `kv_cache_skip_steps`, and
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `diffusion_kv_cache_dtype` | str \| None | `None` | Set to `"fp8"` to enable dynamic FP8 FA on supported attention backends |
+| `diffusion_kv_cache_dtype` | str \| None | `None` | Runtime attention method. Dense FA supports `fp8`, `mxfp8`, and `mxfp4`; BSA supports `fp8` and `mxfp4` |
 | `diffusion_kv_cache_skip_steps` | str \| None | `None` | Denoising step selector to keep in native dtype, for example `"0,1,4-6"` |
 | `diffusion_kv_cache_skip_layers` | str \| None | `None` | Transformer layer selector to keep in native dtype, for example `"0-2,10"` |
 
 Selectors use comma-separated integers and inclusive ranges. Listed steps or
-layers skip FP8 FA; all other eligible full-attention forwards use the FP8 path.
+layers run floating-point attention through the selected Dense or BSA backend;
+all other eligible forwards use `diffusion_kv_cache_dtype`.
 
 ## Validation and Notes
 
@@ -124,40 +123,42 @@ layers skip FP8 FA; all other eligible full-attention forwards use the FP8 path.
 ## Wan2.2 T2V quantized attention on Ascend
 
 Wan2.2 T2V A14B supports quantized self-attention through MindIE-SD. Model
-weights are unchanged. Cross-attention is not quantized, so omit `quant` from
-the cross-attention role.
+weights are unchanged, and model-level opt-out keeps cross-attention in its
+native dtype.
 
-| Attention path | `backend` | Supported `quant.method` |
+| Attention path | self-attention `backend` | Supported `diffusion_kv_cache_dtype` |
 | --- | --- | --- |
 | Dense FA | `FLASH_ATTN` | `fp8`, `mxfp8`, `mxfp4` |
 | BSA | `RAINFUSION_ATTN` | `fp8`, `mxfp4` |
 
-Configure only the self-attention role in the model's deployment YAML:
+Configure the method and fallback selectors once at the diffusion stage. The
+per-role attention config only selects the self-attention backend:
 
 ```yaml
-diffusion_attention_config:
-  per_role:
-    self:
-      backend: FLASH_ATTN  # Use RAINFUSION_ATTN for BSA.
-      quant:
-        method: mxfp8
-        skip_layers: "0,39"
-        skip_steps: "0,1,38,39"
+stages:
+  - stage_id: 0
+    diffusion_kv_cache_dtype: "mxfp8"
+    diffusion_kv_cache_skip_layers: "0,39"
+    diffusion_kv_cache_skip_steps: "0,1,38,39"
+    diffusion_attention_config:
+      per_role:
+        self:
+          backend: FLASH_ATTN  # Use RAINFUSION_ATTN with fp8 or mxfp4 for BSA.
 ```
 
-For 40 denoising steps, `skip_steps: "0,1,38,39"` and
-`skip_layers: "0,39"` are recommended starting points. Steps are zero-based
-across the complete request and do not reset when Wan switches transformers;
-layer indices are zero-based and local to each transformer. Selectors accept
-comma-separated indices and inclusive ranges such as `"0,3-5"`. A selected
-forward uses floating-point attention while preserving the Dense or BSA path.
+For 40 denoising steps, `diffusion_kv_cache_skip_steps: "0,1,38,39"` and
+`diffusion_kv_cache_skip_layers: "0,39"` are recommended starting points. Steps
+are zero-based across the complete request and do not reset when Wan switches
+transformers; layer indices are zero-based and local to each transformer.
+Selectors accept comma-separated indices and inclusive ranges such as
+`"0,3-5"`. A selected forward uses floating-point attention while preserving
+the Dense or BSA path.
 
-Per-role selectors override their corresponding global selectors. An omitted
-selector inherits the global value, and `[]` clears it for that role. Unsupported
-precision/input combinations raise an error and must be corrected in the
-configuration; operator errors are not retried with another precision.
+Unsupported precision/input combinations raise an error and must be corrected
+in the configuration; operator errors are not retried with another precision.
 
-For BSA, change the backend to `RAINFUSION_ATTN` and use `fp8` or `mxfp4`.
+For BSA, change the backend to `RAINFUSION_ATTN` and set
+`diffusion_kv_cache_dtype` to `fp8` or `mxfp4`.
 See [RainFusion attention](../diffusion/attention_backends/rainfusion.md) for
 sparse-path configuration and behavior.
 

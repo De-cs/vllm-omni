@@ -248,13 +248,13 @@ T = TypeVar("T", bound=AttentionMetadata)
 
 
 class AttentionImpl(ABC, Generic[T]):
-    # Per-platform kv_cache_dtype support. Maps OmniPlatformEnum value
-    # (e.g. "cuda", "npu") to the set of quantized dtypes that platform
+    # Per-platform quantized kv_cache_dtype support. Maps OmniPlatformEnum
+    # values (e.g. "cuda", "npu") to the quantized dtypes each platform
     # handles.
     #
     # To add FP8 support for a new platform in a subclass:
-    #   _supported_kv_cache_dtypes = {"cuda": {"fp8"}, "npu": {"fp8"}}
-    _supported_kv_cache_dtypes: dict[str, set[str]] = {}
+    #   _supported_quant_kv_cache_dtypes = {"cuda": {"fp8"}, "npu": {"fp8"}}
+    _supported_quant_kv_cache_dtypes: dict[str, set[str]] = {}
 
     @abstractmethod
     def __init__(
@@ -275,7 +275,7 @@ class AttentionImpl(ABC, Generic[T]):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: str | None, platform_key: str) -> bool:
         if kv_cache_dtype is None:
             return True
-        return kv_cache_dtype in cls._supported_kv_cache_dtypes.get(platform_key, set())
+        return kv_cache_dtype in cls._supported_quant_kv_cache_dtypes.get(platform_key, set())
 
     def forward(
         self,

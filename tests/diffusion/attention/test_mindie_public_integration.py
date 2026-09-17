@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.backends import flash_attn, rainfusion_attn
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.platforms.npu.quant.kv_quant_npu import get_quant_attention_rotation
 
 mindiesd = pytest.importorskip("mindiesd")
@@ -69,9 +70,8 @@ def test_omni_calls_real_dense_public_api(monkeypatch, precision, layout, batch,
         head_size=64,
         softmax_scale=0.37,
         qkv_layout=layout,
-        backend_kwargs={"quant": {"method": precision}},
     )
-    output = impl.forward_fa_quant_npu(query, key, value)
+    output = impl.forward_npu(query, key, value, AttentionMetadata(extra={"kv_cache_dtype": precision}))
     expected = query
     if precision != "mxfp4":
         rotation = get_quant_attention_rotation(query.device, query.dtype, 64)
@@ -136,11 +136,17 @@ def test_omni_calls_real_sparse_public_api(monkeypatch, precision, length):
         head_size=64,
         softmax_scale=0.37,
         qkv_layout="BSND",
-        backend_kwargs={"sparsity": 0.8, "quant": {"method": precision}},
+        backend_kwargs={"sparsity": 0.8},
     )
     plan = rainfusion_attn.RainFusionPlan(used_len=length, prefix_len=0, latent_shape=(1, 1, length))
     try:
-        output = impl._forward_sparse_npu(query, query, query, plan)
+        output = impl._forward_sparse_npu(
+            query,
+            query,
+            query,
+            plan,
+            AttentionMetadata(extra={"kv_cache_dtype": precision}),
+        )
     finally:
         rainfusion_attn._mindiesd_supports_precision.cache_clear()
     torch.testing.assert_close(output, torch.ones_like(query))

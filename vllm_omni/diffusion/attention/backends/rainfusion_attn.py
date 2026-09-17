@@ -176,7 +176,7 @@ class RainFusionAttentionImpl(AttentionImpl):
     irregular video tail internally, retaining it outside the sparse blocks.
     """
 
-    _supported_kv_cache_dtypes = {"npu": {"fp8", "mxfp8", "mxfp4"}}
+    _supported_quant_kv_cache_dtypes = {"npu": {"fp8", "mxfp4"}}
 
     def __init__(
         self,
@@ -196,7 +196,6 @@ class RainFusionAttentionImpl(AttentionImpl):
         self.qkv_layout = qkv_layout
 
         self.rainfusion = RainFusionConfig.from_backend_kwargs(backend_kwargs)
-        self.quant = dict((backend_kwargs or {}).get("quant") or {})
         self.layer_idx = _try_extract_layer_index(prefix)
 
         if self.rainfusion.enabled:
@@ -222,8 +221,6 @@ class RainFusionAttentionImpl(AttentionImpl):
             num_kv_heads=num_kv_heads,
             prefix=prefix,
             qkv_layout=qkv_layout,
-            backend_kwargs={"quant": self.quant} if self.quant else None,
-            role=extra_impl_args.get("role", "self"),
         )
 
     def _validate_parallel_config(self) -> None:
@@ -487,7 +484,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         if plan.video_spans is not None and not _supports_video_spans(sparse_attention):
             raise ValueError(_INCOMPATIBLE_MINDIESD)
         extra = attn_metadata.extra if attn_metadata else {}
-        requested = extra.get("kv_cache_dtype", self.quant.get("method", self.rainfusion.precision))
+        requested = extra.get("kv_cache_dtype", self.rainfusion.precision)
         reason = None
         if requested in ("float", "bf16"):
             precision = "bf16"
@@ -506,8 +503,8 @@ class RainFusionAttentionImpl(AttentionImpl):
         if reason is not None:
             raise ValueError(
                 f"RainFusion precision {requested!r} is unavailable: {reason}. "
-                "Update diffusion_attention_config for this role to use a precision supported by the installed "
-                "MindIE-SD, or set quant.method to 'float'. Automatic precision fallback is not performed."
+                "Set diffusion_kv_cache_dtype or block_sparse.precision to a method supported by the installed "
+                "MindIE-SD, or disable attention quantization. Automatic precision fallback is not performed."
             )
 
         logger.info_once("RainFusion uses MindIE-SD sparse attention, precision=%s.", precision)

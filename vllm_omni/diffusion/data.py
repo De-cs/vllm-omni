@@ -1017,11 +1017,8 @@ class OmniDiffusionConfig:
     # has already resolved to vLLM's ModelOpt FP8 linear method.
     force_cutlass_fp8: bool = False
 
-    # Diffusion attention KV cache dtype (not vLLM's --kv-cache-dtype for AR models).
-    # None = native dtype (no quantization).
-    # "fp8" = dynamic FP8 (float8_e4m3fn) quantization per forward pass.
-    # On Hopper+FA3: native FP8 attention (memory + compute savings).
-    # On other backends: no benefit, backends skip quantization.
+    # Runtime diffusion attention method (not vLLM's --kv-cache-dtype for AR models).
+    # None/"auto" keeps native dtype; other values are validated by the selected backend.
     diffusion_kv_cache_dtype: str | None = None
     # Optional skip selectors for KV-cache quantization. Format: "0-9,20,25-30".
     # Listed steps/layers skip quantization; others keep quantized execution.
@@ -1802,27 +1799,10 @@ class AttnQuantSpec:
     k_block_size: int = 16
     flashinfer_backend: str | None = None
 
-    # NPU method controls are separate from the existing GPU dtype controls.
-    method: str | None = None
-    skip_steps: str | list[int] | None = None
-    skip_layers: str | list[int] | None = None
-
-    _VALID_METHODS = frozenset({"float", "fp8", "mxfp8", "mxfp4"})
     _VALID_DTYPES = frozenset({"float16", "bfloat16", "int8", "fp8_e4m3"})
     _VALID_BLOCK_SIZES = frozenset({1, 4, 16})
 
     def __post_init__(self) -> None:
-        if self.method is not None:
-            if self.method not in self._VALID_METHODS:
-                raise ValueError(f"Unsupported attention quant.method={self.method!r}.")
-            if self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None:
-                raise ValueError("quant.method cannot be combined with dtype_qk/dtype_vo/flashinfer_backend.")
-            if self.q_block_size != 1 or self.k_block_size != 16:
-                raise ValueError("quant.method uses Runtime block sizes; do not set q_block_size/k_block_size.")
-        elif self.skip_steps is not None or self.skip_layers is not None:
-            raise ValueError("skip selectors require quant.method.")
-        parse_kv_cache_skip_selector(self.skip_steps)
-        parse_kv_cache_skip_selector(self.skip_layers)
         for name, v in (("dtype_qk", self.dtype_qk), ("dtype_vo", self.dtype_vo)):
             if v is not None and v not in self._VALID_DTYPES:
                 raise ValueError(f"quant.{name}={v!r} unsupported; use one of {sorted(self._VALID_DTYPES)}.")
@@ -1836,12 +1816,7 @@ class AttnQuantSpec:
     @property
     def enabled(self) -> bool:
         # Include flashinfer_backend so a variant pin without dtypes is serialized.
-        return (
-            self.method is not None
-            or self.dtype_qk is not None
-            or self.dtype_vo is not None
-            or self.flashinfer_backend is not None
-        )
+        return self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None
 
 
 # Backends that select key blocks instead of attending densely, and so accept
@@ -1856,12 +1831,10 @@ class RainFusionPrecision(str, Enum):
     ``fp8``: BSA FP8 path - Hadamard rotation then full FP8 block quantization
         of Q/K/V before the BSA kernel.
     ``mix``: EagleQBSA mixed precision - Q/K per-block INT8 + V per-channel FP8.
-    ``mxfp4``: BSA MXFP4 path provided by MindIE-SD rf_v3.
     """
 
     BF16 = "bf16"
     FP8 = "fp8"
-    MXFP4 = "mxfp4"
     MIX = "mix"
 
 
@@ -1878,7 +1851,6 @@ class BlockSparseSpec:
 
     sparsity: float = 0.8
     start_step: int = 0
-    # Number of final steps kept dense, not an absolute end index.
     end_step: int = 0
     precision: str = RainFusionPrecision.BF16.value
     skip_layers: str | list[int] | None = None
@@ -1920,21 +1892,11 @@ class AttentionSpec:
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
                 "Remove skip_softmax or set backend to TRTLLM_ATTN."
             )
-        if self.quant is not None:
-            allowed = (
-                ("FLASH_ATTN", "RAINFUSION_ATTN")
-                if self.quant.method is not None
-                else ("TRTLLM_ATTN", "FLASHINFER_ATTN")
+        if self.quant is not None and self.backend.upper() not in ("TRTLLM_ATTN", "FLASHINFER_ATTN"):
+            raise ValueError(
+                f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
+                f"backend={self.backend!r}. Remove quant or set a supported backend."
             )
-            if self.backend.upper() not in allowed:
-                raise ValueError(
-                    f"quant is only supported by the {' and '.join(allowed)} backends "
-                    f"for these fields; got {self.backend!r}."
-                )
-        if self.quant is not None and self.quant.method is not None and self.block_sparse is not None:
-            precision = self.block_sparse.precision
-            if precision != "bf16" and precision != self.quant.method:
-                raise ValueError("Conflicting block_sparse.precision and quant.method; use quant.method alone.")
         if self.fastvideo_vsa_topk is not None:
             if self.backend.upper() != "FASTVIDEO_VSA":
                 raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
@@ -1969,10 +1931,7 @@ class AttentionSpec:
                 kw["target_sparsity"] = ss.target_sparsity
             if ss.disabled_until_timestep:
                 kw["disabled_until_timestep"] = ss.disabled_until_timestep
-        if self.quant is not None and self.quant.method is not None:
-            q = self.quant
-            kw["quant"] = {"method": q.method}
-        elif self.quant is not None:
+        if self.quant is not None:
             q = self.quant
             quant_kw: dict[str, Any] = {}
             if q.dtype_qk is not None or q.dtype_vo is not None:
